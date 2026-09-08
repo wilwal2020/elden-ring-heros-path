@@ -2401,9 +2401,21 @@ def main() -> int:
         head = page[page.index("function playHeadPoint()"):]
         head = head[:head.index("\n}")]
         check("the position mark reads the clock, not the drawn line",
-              "play.here = run.xy[n - 1];" in page
+              "play.here = tip || run.xy[n - 1];" in page
               and "getLatLngs()" not in head
               and "play.cursor - 1" not in head)
+        # And it sits between two recorded points rather than on the last one
+        # it went past. Points are a quarter second apart and the tick is a
+        # sixtieth, so without this the head waits on the wrong side of a
+        # point for several frames and then jumps -- which is what "it snaps
+        # from point to point" was.
+        check("and lands between two points, not on the last one passed",
+              "const u = span > 0 ? (now - run.t[n - 1]) / span : 0;" in page
+              and "tip = [a[0] + (b[0] - a[0]) * u, a[1] + (b[1] - a[1]) * u];"
+              in page)
+        check("stepped by the time that really passed, not the nominal tick",
+              "let dt = wall - play.last;" in page
+              and "play.at + play.speed * dt * rate" in page)
         # The timeline is the playback's one measurement of the whole route,
         # so it is the width of the map: an inset panel made it one control
         # among several. Flush left to the sidebar, flush right and flush
@@ -2638,7 +2650,7 @@ def main() -> int:
               "if (animate && markKind(e) === 'warp') {" in page
               and "play.brake = Math.max(play.brake, Date.now() "
                   "+ playBrakeFor(e));" in page
-              and "const rate = Date.now() < play.brake ? PLAY_BRAKE_RATE : 1;"
+              and "const rate = wall < play.brake ? PLAY_BRAKE_RATE : 1;"
               in page)
         check("for as long as the jump is wide on screen",
               "function playBrakeFor(" in page

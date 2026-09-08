@@ -213,7 +213,7 @@ const BREAK_RELOAD = 3;
 // null: wireControls() threw on the first missing checkbox, boot() never
 // reached reload(), and the result was a blank map whose buttons did nothing
 // -- with no clue that the page itself was half a version old.
-const PAGE_BUILD = 50;
+const PAGE_BUILD = 51;
 
 async function boot() {
   checkPageBuild();
@@ -2341,7 +2341,12 @@ function connectLive() {
 
 // A gap longer than this is a night off, or lunch.
 const PLAY_GAP_CAP_MS = 10_000;
-const PLAY_TICK_MS = 80;          // wall clock between steps
+// Sixty a second rather than the twelve it ran at, which is what "it snaps
+// from point to point" was: at thirty seconds a second the head only advances
+// one recorded point a tick, so the step *was* the tick. Affordable because a
+// full repaint of the route canvas measures 0.5 ms median and 1.7 ms worst
+// with the whole of routes.db drawn -- 3% of a second at this rate.
+const PLAY_TICK_MS = 16;          // wall clock between steps
 const PLAY_FLASH_MS = 1500;       // how long a death or a teleport announces
 // A jump bigger than this much of the screen is a leap, and the map is sent
 // straight there rather than gliding: a glide that the next tick interrupts
@@ -2399,6 +2404,8 @@ const play = {
   mark: null, deaths: 0,
   here: null,                     // the point the clock is on, for the mark
   hoverTs: null,                  // the moment under the cursor, if any
+  clocked: 0,                     // when the clock line was last rewritten
+  last: 0,                        // wall clock at the previous step
   onPlane: null,                  // and which map that point is drawn on
   plane0: null,                   // the plane to give back when this is over
   lastAt: null,                   // where the mark was, to measure a leap
@@ -2894,13 +2901,15 @@ function playRecolour(force) {
   if (gone) play.lines = play.lines.filter((i) => i.line._map);
 }
 
-function playLine(run, upto, faint) {
+function playLine(run, upto, faint, tip) {
   const open = playOpen(run.where);
   // Told not to follow the route between maps, the map stays where it was put
   // -- and Siofra's path does not get drawn on Limgrave, which is the whole
   // reason the two are separate maps rather than two layers.
   if (open && (run.plane || 'surface') !== state.plane) return null;
-  const pts = run.xy.slice(0, upto).map(toLatLng);
+  const raw = run.xy.slice(0, upto);
+  if (tip) raw.push(tip);
+  const pts = raw.map(toLatLng);
   const style = {
     renderer: open ? renderer : insideRenderer,
     pane: open ? undefined : 'inside',
@@ -3298,6 +3307,7 @@ function playReset() {
   play.shown.clear();
   play.here = null;
   play.onPlane = null;
+  play.clocked = 0;
   play.lastAt = null;
   play.brake = 0;
   play.lines.length = 0;
@@ -3338,13 +3348,31 @@ function playDrawTo(elapsed, animate) {
     // played at all.
     let n = 1;
     while (n < run.t.length && run.t[n] <= now) n++;
-    play.here = run.xy[n - 1];
+    // Where the clock actually is, rather than the last point it went past.
+    // Recorded points are a quarter of a second apart and the tick is a
+    // sixtieth, so without this the head waits on the wrong side of a point
+    // for several frames and then jumps to it.
+    let tip = null;
+    if (n < run.t.length) {
+      const span = run.t[n] - run.t[n - 1];
+      const u = span > 0 ? (now - run.t[n - 1]) / span : 0;
+      if (u > 0.001) {
+        const a = run.xy[n - 1], b = run.xy[n];
+        tip = [a[0] + (b[0] - a[0]) * u, a[1] + (b[1] - a[1]) * u];
+      }
+    }
+    play.here = tip || run.xy[n - 1];
     play.onPlane = run.plane || 'surface';
-    if (n > 1) {
+    // `|| tip` and not `n > 1` alone: a run reached at its first point now has
+    // a line to draw as soon as the clock is any way into it, instead of
+    // nothing on screen until the second point is passed.
+    if (n > 1 || tip) {
       if (play.head && play.head.run === run) {
-        play.head.line.setLatLngs(run.xy.slice(0, n).map(toLatLng));
+        const pts = run.xy.slice(0, n);
+        if (tip) pts.push(tip);
+        play.head.line.setLatLngs(pts.map(toLatLng));
       } else {
-        const line = playLine(run, n);
+        const line = playLine(run, n, false, tip);
         play.head = line ? { run, line } : null;
       }
     }
@@ -3465,7 +3493,14 @@ function playDrawTo(elapsed, animate) {
   // scrubbing shows the colours of the moment it lands on rather than the
   // ones from a quarter of a second ago.
   playRecolour(!animate);
-  playClockText(elapsed, now);
+  // The clock is read, not watched. Rewriting it and the scrub thumb sixty
+  // times a second is DOM work for something the eye cannot follow anyway;
+  // ten is plenty. A seek is not throttled -- it has to land where it landed.
+  const wall = Date.now();
+  if (!animate || wall - play.clocked > 100) {
+    play.clocked = wall;
+    playClockText(elapsed, now);
+  }
 }
 
 // The speed slider runs from 30 seconds a second to an hour a second. Not a
@@ -3740,11 +3775,26 @@ function playResume() {
   b.title = 'Pause (space)';
   b.setAttribute('aria-label', 'Pause');
   b.classList.add('on');
+  play.last = Date.now();
   play.timer = setInterval(() => {
+    // Advanced by the time that actually passed, not by the nominal tick: a
+    // timer asked for every 16 ms does not get every 16 ms, and stepping the
+    // nominal amount makes the playback quietly slower than the speed it
+    // claims. A gap longer than a quarter second is a tab that was in the
+    // background, and stepping the whole of it would skip a piece of route.
+    const wall = Date.now();
+    let dt = wall - play.last;
+    play.last = wall;
+    // Capped, not reset: a late tick is still worth the time it took. Falling
+    // back to the nominal tick here made the playback run at 86% of the speed
+    // it claimed, because any tick that arrived late lost almost all of its
+    // elapsed time. The cap is what stops a tab that was in the background
+    // for a minute skipping a minute of route in one step.
+    if (dt > 250) dt = 250;
     // Eased off after a teleport, rather than stopped: a playback that halts
     // reads as broken, one that slows reads as arriving.
-    const rate = Date.now() < play.brake ? PLAY_BRAKE_RATE : 1;
-    play.at = Math.min(play.to, play.at + play.speed * PLAY_TICK_MS * rate);
+    const rate = wall < play.brake ? PLAY_BRAKE_RATE : 1;
+    play.at = Math.min(play.to, play.at + play.speed * dt * rate);
     playDrawTo(play.at, true);
     if (play.at >= play.to) {
       playPause();

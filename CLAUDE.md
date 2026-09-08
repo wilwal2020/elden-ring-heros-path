@@ -1166,6 +1166,46 @@ comes out at 0.2 degrees and changes nothing, because its remaining 127 m is
 not orientation either. Every other dungeon is untouched. A rule that can only
 help is worth having even when it helps a little.
 
+**The playback ran at twelve frames a second, and the head only ever sat on a
+recorded point.** Both halves of "it snaps from point to point": the tick was
+80 ms, and `play.here` was `run.xy[n - 1]`, the last point the clock had gone
+past. The drawn route is simplified server-side, so those points can be many
+seconds apart -- median 21.8 map units between neighbours on `routes.db` --
+and the head jumped a whole simplified segment at a time.
+
+Both are fixed and neither was expensive, because the assumption that made the
+tick slow turned out to be wrong. A full repaint of the route canvas with the
+whole of `routes.db` drawn measures **0.5 ms median and 1.7 ms worst**, not the
+19 ms that the zoom-animation note reports for reprojecting 39k points at
+zoom 3 -- so sixty ticks a second costs 3% of a second, and no separate
+renderer for the head was needed. `PLAY_TICK_MS` is 16, and the head is
+interpolated between the two points either side of the clock. Measured at 30
+seconds a second: 199 of 199 ticks moved the mark, median step 0.69 units
+against the 21.8 it used to jump, longest stall zero.
+
+**And the loop steps by the time that really passed.** `play.at += speed *
+PLAY_TICK_MS` assumes a timer asked for every 16 ms delivers every 16 ms,
+which no timer does; the playback was quietly slower than the speed on the
+label. It takes the wall-clock delta now.
+
+The guard on that delta wants care and I got it wrong once. Falling back to
+the nominal tick when the gap was long -- `if (dt > 250) dt = PLAY_TICK_MS` --
+means any late tick loses almost all of its elapsed time, and the playback
+measured **86% of the speed it claimed**. Capping instead (`dt = 250`) keeps a
+late tick worth the time it took while still stopping a tab that was in the
+background for a minute from skipping a minute of route in one step.
+
+Worth knowing when measuring this: the ratio does not come out at 1.0 even
+when it is right, because the teleport easing is deliberately slowing the
+clock. Measured over 2.5 s at five minutes a second: 17.5% of the window
+eased, ratio predicted from that alone 0.835, ratio observed 0.836. Check
+against the prediction rather than against 1.
+
+The clock line is throttled to ten updates a second. It is read, not watched,
+and rewriting it and the scrub thumb sixty times a second is DOM work for
+something the eye cannot follow -- but a seek is never throttled, because it
+has to land where it landed.
+
 **A jump plays as a journey, not as two related points.** Both ends of a
 teleport used to land at the same instant with the line already drawn between
 them, which says "these two places have something to do with each other" and
