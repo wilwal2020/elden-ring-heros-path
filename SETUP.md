@@ -21,9 +21,11 @@ about. See [What is likely to go wrong](#what-is-likely-to-go-wrong).
 | **Elden Ring** | Only for recording. Version 2.7.0.0 is what the signatures were taken against; see [Signatures](MANUAL.md#signatures) if yours is different. |
 | **About 100 MB of disk** | Mostly the map tiles, which come with it. |
 
-Anti-cheat has to be off for the recorder to read the game. That is the same
-condition every practice tool has, and it means offline play. The tracker only
-ever *reads* memory -- it never writes to the game.
+Anti-cheat has to be off for the recorder to read the game --
+[this toggler](https://www.nexusmods.com/eldenring/mods/90) or any other EAC
+bypass will do it. That is the same condition every practice tool has, and it
+means offline play. The tracker only ever *reads* memory: it never writes to
+the game.
 
 ## 2. Download it
 

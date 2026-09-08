@@ -16,26 +16,41 @@ path, not a pile of per-session files.
 
 ---
 
-## Getting started
+## Installation
 
-```bash
-git clone https://github.com/wilwal2020/elden-ring-heros-path.git
-```
+1. **Turn EasyAntiCheat off.** Use [this toggler](https://www.nexusmods.com/eldenring/mods/90)
+   or any other EAC bypass. Reading the game's memory only works with anti-
+   cheat off, and that means playing offline -- the same condition every
+   practice tool has.
 
-Then double-click **`Record route.bat`** -- it starts the game, records while
-you play, and serves the map at the same time. **`Open map.bat`** opens the map
-on its own, with the game shut.
+2. **Install Python 3.10 or newer** from [python.org](https://www.python.org/downloads/),
+   ticking **Add python.exe to PATH** in the installer.
 
-Both find Python themselves and install what is missing on the first run. The
-map background and its calibration come with the repository, so there is
-nothing to build.
+3. **Download the tracker.**
 
-**[SETUP.md](SETUP.md)** is the full walk through, including what to do when it
-does not work.
+   ```bash
+   git clone https://github.com/wilwal2020/elden-ring-heros-path.git
+   ```
 
-You need Windows and Python 3.10 or newer to record; the viewer runs anywhere.
-Anti-cheat has to be off, which means offline play -- the same condition every
-practice tool has.
+   Or press **Code → Download ZIP** on this page and unzip it somewhere you
+   can find again.
+
+4. **Double-click `Record route.bat`.** It starts the game, records while you
+   play, and serves the map at the same time. On the first run it installs the
+   Python packages it needs.
+
+5. **Double-click `Open map.bat`** any time afterwards to look at what you have
+   recorded, with the game shut.
+
+That is all of it. The map background and the calibration that lines it up with
+the world come with the repository, so there is nothing to build.
+
+Recording is Windows only -- it reads the game's memory through `pymem`. The
+viewer runs anywhere Python does, so a recorded route can be looked at on any
+machine.
+
+**[SETUP.md](SETUP.md)** is the longer walk through, including what to do when
+it does not work.
 
 ## What it does that Zelda's doesn't
 
