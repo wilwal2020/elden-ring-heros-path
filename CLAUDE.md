@@ -1,7 +1,8 @@
 # CLAUDE.md
 
-Context for working on this repo. The README covers usage; this covers the
-things that cost time to discover and are not obvious from reading the code.
+Context for working on this repo. README.md is the front page, SETUP.md gets
+it running and MANUAL.md is the reference; this covers the things that cost
+time to discover and are not obvious from reading the code.
 
 ## What this is
 

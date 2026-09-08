@@ -18,7 +18,7 @@ about. See [What is likely to go wrong](#what-is-likely-to-go-wrong).
 |---|---|
 | **Windows** | The recorder reads the game's memory through `pymem`, which is Windows-only. The **viewer** works anywhere Python does, so you can look at a recorded route on any machine. |
 | **Python 3.10 or newer** | From [python.org](https://www.python.org/downloads/). Tick **Add python.exe to PATH** in the installer. Developed and run on 3.14. |
-| **Elden Ring** | Only for recording. Version 2.7.0.0 is what the signatures were taken against; see [Signatures](README.md#signatures) if yours is different. |
+| **Elden Ring** | Only for recording. Version 2.7.0.0 is what the signatures were taken against; see [Signatures](MANUAL.md#signatures) if yours is different. |
 | **About 100 MB of disk** | Mostly the map tiles, which come with it. |
 
 Anti-cheat has to be off for the recorder to read the game. That is the same
@@ -111,7 +111,7 @@ Two points is the minimum it accepts, but use at least three. With two the fit
 is exact by construction -- two unknowns per axis, two equations -- so the
 residual it reports is always zero and tells you nothing about whether the
 answer is right. The long version is in
-[Line up the map with the world](README.md#line-up-the-map-with-the-world).
+[Line up the map with the world](MANUAL.md#line-up-the-map-with-the-world).
 
 ## 6. Try it without the game
 
@@ -160,7 +160,7 @@ success on ten identical readings.
 so plainly rather than reading rubbish. The patterns come from
 [veeenu's practice tool](https://github.com/veeenu/eldenring-practice-tool)
 and usually survive a patch even when the raw offsets do not --
-[Signatures](README.md#signatures) has the details.
+[Signatures](MANUAL.md#signatures) has the details.
 
 **The map is in the wrong place.** Only if you rebuilt the tiles: the shipped
 `[projection]` was fitted to the shipped tiles, and a differently built image
@@ -175,4 +175,4 @@ server once at startup while serving the page fresh from disk, so an update
 can leave a new page talking to an old server.
 
 More of these, with what each symptom actually means, are in
-[Troubleshooting](README.md#troubleshooting).
+[Troubleshooting](MANUAL.md#troubleshooting).
