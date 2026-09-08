@@ -18,9 +18,12 @@ hour a second, easing off at each teleport so you can see where you went.
 > **Not ready for other people yet.** It works, and it is thoroughly tested --
 > 375 automated checks -- but it has run on exactly one machine, against one
 > version of the game, for one person. There is no packaging, no installer and
-> no support, and getting the map background up means extracting art from your
-> own copy of the game. [SETUP.md](SETUP.md) is the honest walk through. It is
-> public because there is no reason to hide it, not because it is finished.
+> no support. [SETUP.md](SETUP.md) is the honest walk through. It is public
+> because there is no reason to hide it, not because it is finished.
+>
+> The map and its calibration come with it, so it draws something the moment
+> you open it -- that artwork is the game's, not mine: see
+> [NOTICE.md](NOTICE.md).
 
 ---
 

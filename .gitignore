@@ -2,14 +2,11 @@
 # routes.db alone is 8 MB after a month.
 data/
 
-# The map background is built from your own copy of the game -- see SETUP.md.
-# It is FromSoftware's artwork, so it is not redistributed here, and the
-# pyramid is 35 MB besides.
-viewer/tiles/
-viewer/tiles-underground/
-m1-underground.png
+# The stitched source images. The tile pyramids built from them are checked in
+# -- see NOTICE.md -- but these are 33 MB each and only needed to cut the
+# tiles again, which nobody has to do.
 m1.png
-viewer/compass.png
+m1-underground.png
 
 # Python leavings
 __pycache__/
