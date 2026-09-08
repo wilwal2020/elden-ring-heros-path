@@ -108,72 +108,26 @@ handling working. Ctrl-C to stop.
 
 Flags go **after** the subcommand: `record --port 9000`, not `--port 9000 record`.
 
-## Add the map background
+## The map background
 
-There's no map bundled with this — you supply the image. Two routes.
+It comes with the repository -- both tile pyramids, surface and underground,
+already cut and already lined up with the world by the `[projection]` block in
+`config/config.toml`. Download it and the map draws.
 
-### Easiest: a pre-assembled map
-
-Someone has already done the extraction and stitching. Search Nexus Mods for
-the **Ultimate Elden Ring Map Resource Pack** (mod 960), which publishes the
-map as ready-to-use images. Download one, skip to `make_tiles.py` below.
-
-### From your own game files
-
-More work, but it's your copy of the game and you get exactly the version you
-want, including the DLC map.
-
-1. **Unpack the archives** with [UXM Selective Unpack](https://github.com/Nordgaren/UXM-Selective-Unpack). This produces loose files, including `menu/71_maptile.tpfbhd` and `.tpfbdt`.
-2. **Unpack the tile archive** with Yabber, which gives you roughly 24,000 `.tpf.dcx` files. Run Yabber again on those to get `.dds` textures.
-3. **Convert to PNG** with `texconv`, or point `build_map.py` straight at the `.dds` files if Pillow can read them.
-4. **Stitch them** with the included tool:
-
-```bash
-python tools/build_map.py path/to/converted/tiles -o lands_between.png
-python tools/build_map.py path/to/converted/tiles -o underground.png --map M01
-```
-
-The [World Map Toolset](https://www.nexusmods.com/eldenring/mods/784) on Nexus
-automates steps 1 to 3 with batch files if you'd rather not run each tool by
-hand.
-
-Keep whatever you extract local. Don't redistribute it.
-
-#### What build_map.py is doing
-
-The game's tiles are named like `MENU_MapTile_M00_L0_16_16_0000000c`: map
-(`M00` overworld, `M01` underground), detail level (`L0` is the most detailed),
-X, Y, then eight hex digits of map-fragment flags.
-
-Two things make naive stitching go wrong, and the tool handles both. There are
-several variants of each coordinate, one per combination of map fragments the
-player might have, so it picks the one with the most flag bits set — the
-fully-revealed version. That heuristic also skips the known junk tiles, which
-carry fewer bits than the real tile at the same coordinate. And the game's Y
-axis counts up from the bottom while image rows count down from the top, so it
-flips.
-
-### Then tile it
-
-```bash
-python tools/make_tiles.py lands_between.png --clean
-```
-
-It prints the image dimensions. Put them in `config/config.toml` under
-`[viewer]`, along with the top zoom level it generated:
-
-```toml
-image_width   = 10496
-image_height  = 10496
-tile_max_zoom = 5
-```
-
-Install `pyvips` first if the image is large; Pillow works but is much slower.
+That artwork is the game's, not mine; [NOTICE.md](NOTICE.md) says so properly.
+If you ever need to rebuild it -- a different game version, a different detail
+level -- step 4 of [SETUP.md](SETUP.md) has the extract-stitch-tile run
+through, and `tools/build_map.py --help` explains the flags. A rebuilt image
+needs its own calibration, which is the next section.
 
 ## Line up the map with the world
 
-The transform from world metres to map pixels depends on which image you
-tiled, so it's fitted rather than hardcoded. Two ways to do it.
+**Already done for the map that ships with this** -- `[projection]` in
+`config/config.toml` was fitted against exactly these tiles, worst point 1.1 px
+out. This section is for a map you rebuilt yourself: the transform from world
+metres to map pixels depends on which image you tiled, so it is fitted rather
+than hardcoded. Three ways to do it, and the first two are buttons in the
+viewer.
 
 ### Align by eye (most reliable)
 
@@ -830,15 +784,11 @@ to one drawn in SVG, so this still works with no image at all.
 Siofra, Ainsel and Deeproot share the overworld's grid but sit far below it,
 so they are a different map rather than a layer on top of one. **Map** in the
 side panel switches between them; the route, its marks and the background all
-follow. If you have built an underground map --
-
-```bash
-python tools/build_map.py path/to/tiles -o underground.png --map M01
-python tools/make_tiles.py underground.png     # into viewer/tiles-underground
-```
-
--- the terrain switches too; if not, the surface stays up behind the route and
-the panel says so.
+follow. The underground pyramid ships with the repository, so the terrain
+switches too -- built with `build_map.py --map M01` and tiled into
+`viewer/tiles-underground`, which is where the viewer looks for it by name. If
+that directory is ever missing, the surface stays up behind the route and the
+panel says so rather than showing a black screen.
 
 ## Marks on the map
 
