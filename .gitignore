@@ -1,0 +1,27 @@
+# Your own route history. It is your play, not the program, and it is large:
+# routes.db alone is 8 MB after a month.
+data/
+
+# The map background is built from your own copy of the game -- see SETUP.md.
+# It is FromSoftware's artwork, so it is not redistributed here, and the
+# pyramid is 35 MB besides.
+viewer/tiles/
+viewer/tiles-underground/
+m1-underground.png
+m1.png
+viewer/compass.png
+
+# Python leavings
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editor and OS leavings
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.swp
+Untitled*

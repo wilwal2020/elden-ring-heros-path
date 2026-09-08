@@ -1,0 +1,16 @@
+# Core (all platforms)
+aiohttp>=3.9
+
+# Live capture from the running game (Windows only).
+# Everything else works without it -- use --source sim.
+pymem>=1.13 ; sys_platform == "win32"
+# Lets probe report the game version (offsets are version-specific)
+pywin32>=306 ; sys_platform == "win32"
+
+# Tile generation. pyvips is much faster on large map images; Pillow is the
+# easy fallback. Install one.
+Pillow>=10.0
+# pyvips>=2.2
+
+# Python 3.10 or older only (3.11+ has tomllib built in)
+tomli>=2.0 ; python_version < "3.11"

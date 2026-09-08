@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- This page and app.js are one thing in two files: the script looks up
+     controls this page declares. Bumped together whenever a control is added,
+     so a browser holding one and not the other says so instead of dying on
+     the first missing element. -->
+<meta name="page-build" content="50">
+<title>Route</title>
+<link rel="stylesheet" href="vendor/leaflet.css">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="map"></div>
+
+<div id="compass" aria-hidden="true">
+  <img id="compass-png" src="compass.png" alt="">
+  <svg id="compass-svg" viewBox="0 0 120 120" hidden>
+    <!-- Drawn rather than shipped: a file at viewer/compass.png replaces it,
+         and until there is one this needs no binary asset to work offline. -->
+    <g class="rose">
+      <path d="M60 6 L67 53 L60 60 L53 53 Z"/>
+      <path d="M114 60 L67 53 L60 60 L67 67 Z"/>
+      <path d="M60 114 L53 67 L60 60 L67 67 Z"/>
+      <path d="M6 60 L53 67 L60 60 L53 53 Z"/>
+      <path d="M60 60 L64 50 L86 34 L70 56 Z"/>
+      <path d="M60 60 L56 50 L34 34 L50 56 Z"/>
+      <path d="M60 60 L64 70 L86 86 L70 64 Z"/>
+      <path d="M60 60 L56 70 L34 86 L50 64 Z"/>
+      <circle cx="60" cy="60" r="9" class="ring"/>
+      <circle cx="60" cy="60" r="3"/>
+    </g>
+    <g class="letters">
+      <text x="60" y="8" text-anchor="middle">N</text>
+      <text x="116" y="64" text-anchor="middle">E</text>
+      <text x="60" y="119" text-anchor="middle">S</text>
+      <text x="4" y="64" text-anchor="middle">W</text>
+    </g>
+  </svg>
+</div>
+
+<div id="dimmer" title="Drag down to darken the map">
+  <span class="dim-end" aria-hidden="true">☀</span>
+  <input type="range" id="dim" min="20" max="100" step="1" value="100">
+  <span class="dim-end" aria-hidden="true">☾</span>
+</div>
+
+<p id="caption" hidden></p>
+
+<div id="inset" hidden>
+  <header>
+    <div>
+      <h3 id="inset-title">Inside</h3>
+      <p id="inset-sub" class="hint"></p>
+    </div>
+    <button id="inset-close" class="ghost" title="Close (Escape)"
+            aria-label="Close">&#10005;</button>
+  </header>
+  <canvas id="inset-canvas" width="352" height="352"></canvas>
+  <!-- The figures as figures rather than as a sentence: four things you read
+       at a glance instead of one line you parse. -->
+  <dl id="inset-figures"></dl>
+  <p id="inset-stats" class="hint"></p>
+</div>
+
+<!-- Both of these belong to the map rather than the panel: they are only up
+     during playback, and what they are about is happening out there. -->
+<div id="toll" hidden aria-live="polite">
+  <span class="skull">&#9760;</span><b id="toll-n">0</b>
+  <i>deaths so far</i>
+</div>
+
+<!-- The timeline is what the playback is for, so it runs the whole width of
+     the map. Everything else is arranged around it: the speed on the left,
+     the clock in the middle, the one button that writes something on the
+     right, and the transport sitting on the track itself. -->
+<!-- Places that are nowhere in the world. Pinned to the corner of the screen
+     rather than to a corner of the map, because they are not on it: the
+     Roundtable Hold has no way in on foot at all. Opens the inset without
+     moving the map, during playback as well. -->
+<div id="offmap" hidden></div>
+
+<div id="timeline" hidden>
+  <div class="play-track">
+    <input type="range" id="play-scrub" min="0" max="1000" step="1" value="0"
+           aria-label="Position in the playback">
+    <!-- One thin red line per death, so the timeline says where they are
+         before you get to them. Under the thumb, over the track. -->
+    <div id="play-ticks" aria-hidden="true"></div>
+    <!-- Where the bit of path under the cursor happened. Pressing it goes
+         there. -->
+    <button id="play-hover" hidden></button>
+  </div>
+  <div class="play-row">
+    <!-- Two lines: where you are in the route needs 429px at its longest and
+         the slot beside a centred transport is 275px, so the moment is the
+         headline and the counting sits under it. -->
+    <div id="play-clock" class="hint">
+      <b id="play-when"></b><span id="play-pos"></span>
+    </div>
+    <!-- Centred on the map, so the play button lands under the middle of the
+         timeline it drives, with the speed either side of it. -->
+    <div class="play-mid">
+      <input type="range" id="play-speed" min="0" max="13" step="1" value="6"
+             aria-label="How much faster than you walked it">
+      <div class="play-transport">
+        <button id="play-back" class="step" title="One point back (,)"
+                aria-label="One point back">&#8249;</button>
+        <button id="play-toggle" class="on" title="Pause (space)"
+                aria-label="Pause">&#9208;&#65038;</button>
+        <button id="play-fwd" class="step" title="One point on (.)"
+                aria-label="One point on">&#8250;</button>
+      </div>
+      <span id="play-rate">5 min a second</span>
+    </div>
+    <button id="play-died" class="ghost" title="Mark a death here (D)">I died
+      here</button>
+  </div>
+</div>
+
+<aside id="panel">
+  <header>
+    <h1>Route</h1>
+    <p id="status" class="status">Connecting</p>
+  </header>
+
+  <section id="playback-box">
+    <button id="play" class="play-btn">Play the route back</button>
+    <p class="hint">Clears the map and walks it again in the order you made
+      it, caves and deaths included. The same button stops it, and so does
+      Escape.</p>
+  </section>
+
+  <section>
+    <h2>Map</h2>
+    <div class="choice">
+      <button id="plane-surface" class="pick-btn on">Surface</button>
+      <button id="plane-underground" class="pick-btn">Underground</button>
+    </div>
+    <label class="toggle"><input type="checkbox" id="auto-plane" checked>
+      Follow the route between maps</label>
+    <p class="hint" id="plane-note">Siofra, Ainsel and Deeproot run below the
+      Lands Between, so they are their own map rather than a layer on top of
+      it.</p>
+  </section>
+
+  <section>
+    <h2>Markers</h2>
+    <label class="toggle"><input type="checkbox" id="l-interior" checked> Caves and dungeons</label>
+    <label class="toggle"><input type="checkbox" id="l-deaths" checked> Deaths</label>
+    <label class="toggle"><input type="checkbox" id="l-respawns" checked> Where you respawned</label>
+    <label class="toggle"><input type="checkbox" id="l-warps" checked> Teleports</label>
+  </section>
+
+  <section>
+    <h2>Follow</h2>
+    <label class="toggle"><input type="checkbox" id="l-follow"> Keep me in view</label>
+    <div class="slider"><span>Edge margin</span>
+      <input type="range" id="follow-pad" min="0" max="100" step="1" value="25"></div>
+    <p class="hint" id="follow-label">How close to the edge of the screen you
+      can get before the map moves.</p>
+  </section>
+
+  <section>
+    <h2>The path</h2>
+    <div class="slider"><span>Type</span>
+      <select id="tint-mode">
+        <option value="height">By elevation</option>
+        <option value="age">By age</option>
+        <option value="solid">One colour</option>
+      </select></div>
+    <div class="slider" id="colour-row" hidden><span>Line colour</span>
+      <input type="color" id="line-colour" value="#e0a33c"></div>
+    <div class="slider" id="age-depth-row" hidden><span>Oldest</span>
+      <input type="range" id="age-depth" min="0" max="9" step="1" value="0"></div>
+    <p class="hint" id="age-depth-label" hidden></p>
+    <div id="ramp" class="ramp" hidden>
+      <span id="ramp-low">low</span><i></i><span id="ramp-high">high</span>
+    </div>
+    <details class="fold">
+      <summary>Line thickness and outline</summary>
+      <div class="slider"><span>Thickness</span>
+        <input type="range" id="line-weight" min="1" max="9" step="0.5" value="3"></div>
+      <div class="slider"><span>Outline</span>
+        <input type="range" id="line-casing" min="0" max="9" step="0.5" value="3"></div>
+    </details>
+  </section>
+
+  <section id="unplaced-box" hidden>
+    <h2>Interiors with no place on the map</h2>
+    <p class="hint">Nothing recorded says where these are: either the
+      recording began inside, you only ever warped in and warped out, or you
+      said so yourself with <b>Take it off the map</b> &mdash; the Roundtable
+      Hold has no way in on foot at all. One row per visit, and one button in
+      the bottom-left corner of the map for the place. They get the inset
+      instead of a spot on the map picked at random &mdash; but if you know
+      where one belongs, <b>Put on map</b> and click it there.</p>
+    <div id="unplaced" class="sessions"></div>
+  </section>
+
+  <section>
+    <h2>Time</h2>
+    <p class="hint" id="range-label">Everything recorded</p>
+    <div class="range">
+      <div class="range-track"><div class="range-fill" id="t-fill"></div></div>
+      <input type="range" id="t-from" min="0" max="100" value="0">
+      <input type="range" id="t-to" min="0" max="100" value="100">
+    </div>
+    <button id="reset-time" class="ghost">Show everything</button>
+  </section>
+
+  <section>
+    <h2>Numbers</h2>
+    <div id="numbers" class="stats"></div>
+  </section>
+
+  <section>
+    <h2>Sessions</h2>
+    <p class="hint">All sessions are drawn as one continuous path, newest
+      first. Untick any you want hidden.</p>
+    <div id="sessions" class="sessions"></div>
+    <button id="more-sessions" class="ghost" hidden></button>
+  </section>
+
+  <section id="cal">
+    <h2>Calibrate</h2>
+    <p class="hint">Line the route up with the map. Needs the recorder running.</p>
+    <button id="cal-start" class="ghost">Click landmarks</button>
+    <button id="align-start" class="ghost">Align by eye</button>
+    <div id="cal-live" hidden>
+      <p class="hint" id="cal-step"></p>
+      <div id="cal-points" class="sessions"></div>
+      <button id="cal-finish" class="ghost" hidden>Compute projection</button>
+      <button id="cal-cancel" class="ghost">Cancel</button>
+    </div>
+    <div id="align-live" hidden>
+      <p class="hint">Drag until the route sits on the right terrain. The map
+        stays put; the route moves.</p>
+      <label class="toggle"><input type="checkbox" id="align-lock" checked>
+        Lock aspect ratio</label>
+      <div class="slider"><span>Scale</span>
+        <input type="range" id="a-scale" min="-3" max="3" step="0.002" value="0"></div>
+      <div class="slider" id="a-scaley-row" hidden><span>Scale Y</span>
+        <input type="range" id="a-scaley" min="-3" max="3" step="0.002" value="0"></div>
+      <div class="slider"><span>Left / right</span>
+        <input type="range" id="a-x" min="-1" max="1" step="0.001" value="0"></div>
+      <div class="slider"><span>Up / down</span>
+        <input type="range" id="a-y" min="-1" max="1" step="0.001" value="0"></div>
+      <label class="toggle"><input type="checkbox" id="align-flip" checked>
+        Flip vertically</label>
+      <button id="align-fit" class="ghost">Reset to fit</button>
+      <button id="align-done" class="ghost">Use these values</button>
+      <button id="align-cancel" class="ghost">Cancel</button>
+    </div>
+    <pre id="cal-out" hidden></pre>
+  </section>
+
+  <footer>
+    <p id="stats" class="hint"></p>
+  </footer>
+</aside>
+
+<script src="vendor/leaflet.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

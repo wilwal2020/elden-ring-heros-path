@@ -1,0 +1,1319 @@
+/* The map is the whole point, so the chrome stays quiet and the route line
+   is the only saturated thing on screen. */
+
+:root {
+  --ink:        #0b2526;
+  --panel:      #0e2c2d;
+  --panel-deep: #082021;
+  --edge:       #1b4143;
+  --text:       #dcebe8;
+  --text-dim:   #7fa3a1;
+  --route:      #e0a33c;
+  --route-deep: #6f8fa8;
+  --marker:     #b9743c;
+  --rule:       rgba(220, 235, 232, 0.09);
+}
+
+/* The panel scrolls, and an unstyled scrollbar in the middle of a dark
+   sidebar is the one bit of chrome the browser will not theme for you. */
+* { scrollbar-width: thin; scrollbar-color: var(--edge) transparent; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: var(--panel-deep); }
+::-webkit-scrollbar-thumb {
+  background: var(--edge);
+  border-radius: 6px;
+  border: 2px solid var(--panel-deep);
+}
+::-webkit-scrollbar-thumb:hover { background: #2b5f61; }
+
+* { box-sizing: border-box; }
+
+/* The browser's own [hidden] rule is display:none at the lowest specificity,
+   so any class here that sets a display -- .slider, .ramp, .toggle -- quietly
+   beat it, and elements marked hidden stayed on screen. */
+[hidden] { display: none !important; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--ink);
+  color: var(--text);
+  font: 15px/1.5 "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+}
+
+#map {
+  position: absolute;
+  inset: 0 0 0 348px;
+  background: var(--ink);
+}
+
+#panel {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 348px;
+  padding: 22px 20px 26px;
+  overflow-y: auto;
+  background: var(--panel);
+  border-right: 1px solid var(--edge);
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+#panel h1 {
+  margin: 0;
+  font-size: 27px;
+  font-weight: 400;
+  letter-spacing: 0.01em;
+  color: var(--text);
+}
+
+/* Title and status are one block. The space under it is what separates the
+   masthead from the controls: a rule there would make the title look like
+   just another section heading. */
+#panel > header { margin-bottom: 16px; }
+
+#panel > header + section { border-top-color: var(--edge); }
+
+/* Full-bleed, so the rule reaches both edges of the panel and reads as a
+   division of the column rather than a line drawn inside it. */
+#panel > section {
+  margin: 0 -20px;
+  padding: 21px 20px 5px;
+  border-top: 1px solid var(--rule);
+}
+
+/* The heading does the work the boxes were doing: small, letterspaced, and
+   trailing a rule that fades out, so the eye finds the start of a section
+   without anything being drawn around it. */
+#panel > section > h2 {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 0 0 11px;
+  font-size: 10.5px;
+  font-weight: 400;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: #9cc0bd;
+  font-family: system-ui, sans-serif;
+}
+
+/* The rule leaving each heading picks up the amber the route is drawn in and
+   loses it immediately. Enough to give the heading an anchor; not enough to
+   be a decoration in its own right. */
+#panel > section > h2::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg,
+    rgba(224, 163, 60, 0.4), var(--rule) 28%, transparent);
+}
+
+#panel h2 {
+  margin: 0 0 10px;
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--text-dim);
+  font-family: system-ui, sans-serif;
+  letter-spacing: 0.02em;
+}
+
+.status { margin: 4px 0 0; font-size: 13px; color: var(--text-dim); }
+.status[data-live="1"] { color: var(--route); }
+
+.hint {
+  margin: 0 0 9px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  opacity: 0.85;
+  font-family: system-ui, sans-serif;
+}
+
+.toggle {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 4px 0;
+  font-size: 14px;
+  cursor: pointer;
+  font-family: system-ui, sans-serif;
+}
+
+.toggle input { accent-color: var(--route); width: 15px; height: 15px; }
+
+.ramp {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  font-family: system-ui, sans-serif;
+}
+
+.ramp i {
+  flex: 1;
+  height: 7px;
+  border-radius: 4px;
+  background: linear-gradient(90deg, #4a6d8c, #7fa07a, #e0a33c, #d8613a);
+}
+
+input[type=range] {
+  width: 100%;
+  accent-color: var(--route);
+  margin: 3px 0;
+}
+
+.ghost {
+  margin-top: 8px;
+  padding: 6px 11px;
+  background: none;
+  color: var(--text-dim);
+  border: 1px solid var(--edge);
+  border-radius: 3px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  font-family: system-ui, sans-serif;
+}
+
+.ghost:hover { color: var(--text); border-color: var(--text-dim); }
+.ghost:focus-visible, .toggle input:focus-visible { outline: 2px solid var(--route); outline-offset: 2px; }
+
+.sessions { display: flex; flex-direction: column; gap: 1px; }
+
+.sessions .toggle span {
+  margin-left: auto;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+#panel footer {
+  margin-top: auto;
+  padding-top: 14px;
+  margin-left: -20px;
+  margin-right: -20px;
+  padding-left: 20px;
+  padding-right: 20px;
+  border-top: 1px solid var(--rule);
+}
+
+.leaflet-container { background: var(--ink); }
+
+.leaflet-popup-content-wrapper, .leaflet-popup-tip {
+  background: var(--panel);
+  color: var(--text);
+  border-radius: 3px;
+}
+
+.leaflet-popup-content { margin: 11px 13px; font-size: 13.5px; }
+.leaflet-popup-content b { font-weight: 600; }
+
+.no-tiles {
+  position: absolute;
+  left: 50%; top: 22px;
+  transform: translateX(-50%);
+  z-index: 500;
+  padding: 9px 15px;
+  max-width: 460px;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 3px;
+  font-size: 13px;
+  color: var(--text-dim);
+  font-family: system-ui, sans-serif;
+}
+
+@media (max-width: 720px) {
+  #panel { position: static; width: auto; height: 46vh; border-right: 0; border-bottom: 1px solid var(--edge); }
+  #map { inset: 46vh 0 0 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}
+
+#cal-out {
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  background: var(--panel-deep);
+  border: 1px solid var(--edge);
+  border-radius: 3px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--route);
+  white-space: pre;
+  overflow-x: auto;
+  user-select: all;
+}
+
+#cal-points .cal-pt {
+  display: flex;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  font-family: system-ui, sans-serif;
+}
+
+#cal .ghost { margin-right: 6px; }
+
+.map-picking, .map-picking .leaflet-grab { cursor: crosshair !important; }
+
+.slider { display: flex; align-items: center; gap: 10px; margin: 7px 0; }
+.slider span {
+  flex: 0 0 82px;
+  font-size: 12px;
+  color: var(--text-dim);
+  font-family: system-ui, sans-serif;
+}
+.slider input[type=range] { flex: 1; margin: 0; }
+
+/* The interior inset. Cave and dungeon coordinates share no frame with the
+   world plane, so they get their own little panel with their own axes rather
+   than being forced onto the map. */
+
+#inset {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  z-index: 900;
+  width: 384px;
+  padding: 14px 16px 12px;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 5px;
+  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.5);
+  /* 535px tall with the canvas at 352: on a short window it would run off the
+     top, so it scrolls inside itself rather than off the screen. */
+  max-height: calc(100vh - 32px);
+  overflow-y: auto;
+}
+
+/* Opened from the disc in the corner, it comes out of the disc: anchored to
+   the same left edge, sitting just above it, and grown from that corner. */
+#inset.from-corner {
+  right: auto;
+  left: calc(348px + 18px);
+  bottom: 84px;
+  transform-origin: 0 100%;
+  animation: inset-open 190ms cubic-bezier(0.2, 0.9, 0.3, 1);
+  max-height: calc(100vh - 100px);
+}
+
+body.playing #inset.from-corner {
+  bottom: 170px;
+  max-height: calc(100vh - 186px);
+}
+
+@keyframes inset-open {
+  from { transform: scale(0.28) translateY(18px); opacity: 0; }
+  to   { transform: scale(1) translateY(0); opacity: 1; }
+}
+
+#inset header {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+#inset h3 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 400;
+  letter-spacing: 0.01em;
+}
+
+#inset header .hint { margin: 3px 0 0; }
+
+/* A cross rather than the word, so the header is a title and not a sentence
+   with a button on the end of it. */
+#inset header .ghost {
+  margin: -2px -4px 0 auto;
+  flex: none;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  font-size: 13px;
+  line-height: 1;
+  border-radius: 50%;
+}
+
+#inset canvas {
+  display: block;
+  width: 352px;
+  height: 352px;
+  background: var(--panel-deep);
+  border: 1px solid var(--edge);
+  border-radius: 3px;
+}
+
+/* Four figures on one line each half, read at a glance. */
+#inset-figures {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 9px 14px;
+  margin: 12px 0 0;
+}
+
+#inset-figures div { min-width: 0; }
+
+#inset-figures dt {
+  margin: 0;
+  font-size: 10px;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+#inset-figures dd {
+  margin: 2px 0 0;
+  font-size: 14px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#inset-stats { margin: 10px 0 0; }
+#inset-stats:empty { display: none; }
+
+.leaflet-popup-content .visit {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  font-family: system-ui, sans-serif;
+}
+
+.leaflet-popup-content .visit .ghost { margin: 0 0 0 auto; flex: none; }
+.leaflet-popup-content .hint { margin: 8px 0 0; }
+
+.sessions .session-when { font-size: 13.5px; }
+
+.session-row { display: flex; align-items: center; gap: 6px; }
+.session-row .toggle { flex: 1; min-width: 0; }
+.session-row .session-when { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.session-row .del {
+  margin: 0;
+  padding: 1px 7px 3px;
+  line-height: 1;
+  font-size: 15px;
+  border-color: transparent;
+  /* Visible but quiet: hiding it until hover makes a button the user asked
+     for undiscoverable, and there is nothing to hover on a touch screen. */
+  opacity: 0.4;
+}
+
+.session-row:hover .del,
+.session-row .del:focus-visible { opacity: 1; }
+.session-row .del:hover { color: #d8613a; border-color: #d8613a; }
+
+.session-row.confirming { flex-wrap: wrap; padding: 4px 0; }
+.session-row.confirming .hint { flex: 1 0 100%; margin: 0 0 4px; }
+.session-row.confirming .ghost { margin-top: 0; }
+.ghost.danger { color: #d8613a; border-color: #6b3a26; }
+.ghost.danger:hover { color: #f0764a; border-color: #d8613a; }
+
+#unplaced .session-row { padding: 2px 0; }
+#unplaced .session-when { font-size: 13px; color: var(--text-dim); }
+#unplaced .ghost { margin: 0 0 0 auto; flex: none; padding: 3px 8px; }
+
+/* Map marks. The map is a warm painting and the route is amber, so a bare
+   glyph disappears into both: every mark is a dark disc with a coloured ring,
+   which reads at any zoom and over any terrain. */
+.death-mark, .warp-mark, .cave-mark, .respawn-mark {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* Leaflet positions marker icons with position:absolute and a transform.
+     This file loads after leaflet.css, so `position: relative` here quietly
+     won that cascade and put every icon back into normal flow: each one was
+     then offset by the ones before it, by a fixed number of screen pixels
+     that does not scale with the map -- which reads as the markers sliding
+     around as you zoom. Absolute is also what makes this box the containing
+     block for the count badge. */
+  position: absolute;
+  border-radius: 50%;
+  background: rgba(14, 12, 9, 0.88);
+  cursor: pointer;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.death-mark { color: #ff5a45; border: 1.5px solid rgba(255, 90, 69, 0.95); font-size: 11px; }
+/* The grace you got up at. Warm rather than red: the death is the bad news
+   and this is the other half of it, so it should not compete for the eye. */
+.respawn-mark {
+  color: #f5d98a;
+  border: 1.5px solid rgba(245, 217, 138, 0.9);
+  font-size: 12px;
+}
+.warp-mark  { color: #8fd0f0; border: 1.5px solid rgba(143, 208, 240, 0.9); font-size: 11px; }
+/* Where you left from, as opposed to where you turned up: same family, dimmer,
+   so a pair reads as one jump with a direction. */
+.warp-mark.warp-from { color: #6f93a8; border-color: rgba(111, 147, 168, 0.85); }
+
+/* Dungeons get the biggest mark: it is the one you go looking for, and the
+   old four-pixel circle was invisible against the terrain. */
+.cave-mark {
+  color: #f0b45c;
+  border: 2px solid rgba(240, 180, 92, 0.95);
+  font-size: 12px;
+}
+.cave-mark:hover { background: rgba(240, 180, 92, 0.25); }
+
+/* Legacy dungeons: paler and cooler than a cave, because they are drawn on
+   the map at all times and should not read as another hole to go looking in. */
+.cave-mark.keep-mark {
+  color: #ecd9b0;
+  border-color: rgba(236, 217, 176, 0.95);
+  font-size: 14px;
+}
+.cave-mark.keep-mark::after { border-top-color: rgba(236, 217, 176, 0.95); }
+.cave-mark.keep-mark:hover { background: rgba(236, 217, 176, 0.25); }
+
+/* The tail is the point of the thing: it lands on the entrance, so the mark
+   means one place rather than a circle's worth of them. */
+.cave-mark::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 100%;
+  margin-left: -5px;
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-top: 7px solid rgba(240, 180, 92, 0.95);
+}
+
+/* The death toll sits opposite the visit count, in the red the death marks
+   use, so the two numbers on one pin cannot be read as the same kind of
+   thing. */
+.cave-mark .deaths {
+  position: absolute;
+  right: -6px;
+  top: -6px;
+  padding: 0 3px;
+  min-width: 14px;
+  border-radius: 7px;
+  background: #2a0f0c;
+  color: #ff8a72;
+  border: 1px solid #ff5a45;
+  font: 600 9px/14px system-ui, sans-serif;
+  font-style: normal;
+  text-align: center;
+}
+
+.toll {
+  margin: 6px 0 2px;
+  font-size: 12.5px;
+  color: #ff8a72;
+  font-family: system-ui, sans-serif;
+}
+
+.death-mark .count, .cave-mark .count, .respawn-mark .count {
+  position: absolute;
+  right: -5px;
+  bottom: -5px;
+  padding: 0 3px;
+  min-width: 13px;
+  border-radius: 7px;
+  background: #12100c;
+  border: 1px solid currentColor;
+  font: 600 9px/13px system-ui, sans-serif;
+  font-style: normal;
+  text-align: center;
+}
+
+/* The interior overlay's canvas covers the whole map, and it sits above the
+   marker pane so the dimmed world does not dim it. A canvas that size eats
+   every click and hover underneath it, so it is made transparent to the
+   pointer; the marks drawn inside the dungeon live in their own pane above,
+   where they are small enough to block nothing. */
+.leaflet-pane.inside-pane { pointer-events: none; }
+/* The line a teleport draws across the map gets its own canvas, so fading it
+   out repaints one line rather than the whole route. */
+.leaflet-pane.arc-pane { pointer-events: none; }
+
+/* What the overlay is showing, and what it can't tell you. */
+#caption {
+  position: absolute;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  z-index: 700;
+  margin: 0;
+  padding: 7px 13px;
+  max-width: 640px;
+  background: rgba(8, 32, 33, 0.94);
+  border: 1px solid var(--edge);
+  border-radius: 3px;
+  font-family: system-ui, sans-serif;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  pointer-events: none;
+}
+
+/* Where you are now. Pale and ringed so it reads against the route it sits
+   on top of, and inert to the pointer: it moves with you, so a popup on it
+   would be a moving target. */
+.you-mark {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: absolute;
+  border-radius: 50%;
+  color: #fff4dc;
+  font-size: 13px;
+  line-height: 1;
+  background: rgba(14, 12, 9, 0.7);
+  border: 2px solid #fff4dc;
+  box-shadow: 0 0 6px rgba(255, 244, 220, 0.55);
+  pointer-events: none;
+}
+
+.no-tiles.stale { border-color: #d8613a; color: var(--text); }
+
+/* --- the compass ---------------------------------------------------------
+   Top right, out of the way of the route and inert to the pointer. If a file
+   called compass.png is put in viewer/ it is used instead of the drawing. */
+
+#compass {
+  position: absolute;
+  top: 14px;
+  right: 46px;
+  z-index: 600;
+  width: 148px;
+  height: 148px;
+  opacity: 0.85;
+  pointer-events: none;
+  filter: drop-shadow(0 1px 4px rgba(12, 10, 8, 0.95));
+}
+
+/* contain, not stretch: the drawn one is square but a supplied image need
+   not be, and squashing someone's compass is a poor way to treat it. */
+#compass img, #compass svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: contain;
+}
+#compass .rose { fill: #f2ead6; }
+#compass .rose .ring { fill: none; stroke: #f2ead6; stroke-width: 4; }
+#compass .letters text {
+  fill: #f2ead6;
+  font: 700 15px/1 "Iowan Old Style", Palatino, Georgia, serif;
+}
+
+/* --- the map dimmer ------------------------------------------------------
+   A vertical slider against the right edge: drag it down and the terrain
+   goes dark, so a route drawn over a busy painting can be read. */
+
+#dimmer {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  right: 12px;
+  z-index: 600;
+  padding: 10px 6px;
+  border-radius: 20px;
+  background: rgba(8, 32, 33, 0.78);
+  border: 1px solid var(--edge);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Sun above, moon below, so which way is dark needs no explaining. */
+.dim-end {
+  font-size: 13px;
+  line-height: 1;
+  color: var(--text-dim);
+  user-select: none;
+}
+
+#dimmer input[type=range] {
+  writing-mode: vertical-lr;
+  /* The value is brightness now, not dimness, so rtl is the one that wants:
+     it puts the low end at the bottom, which means dragging down still
+     darkens and the filled amber part of the track sits under the thumb --
+     bright at the top by the sun, dark at the bottom by the moon. Measured
+     both ways; reasoning about vertical ranges does not work. */
+  direction: rtl;
+  -webkit-appearance: slider-vertical;
+  width: 14px;
+  height: 180px;
+  margin: 0;
+  accent-color: var(--route);
+}
+
+.slider select, .slider input[type=color] {
+  flex: 1;
+  min-width: 0;
+  background: var(--panel-deep);
+  color: var(--text);
+  border: 1px solid var(--edge);
+  border-radius: 3px;
+  font: inherit;
+  font-size: 13px;
+  font-family: system-ui, sans-serif;
+  padding: 3px 5px;
+}
+
+.slider input[type=color] { padding: 1px 2px; height: 26px; cursor: pointer; }
+
+/* Two states of one thing, not two independent switches: the map is either
+   the surface or what runs under it. */
+.choice { display: flex; gap: 6px; }
+
+.pick-btn {
+  flex: 1;
+  padding: 7px 10px;
+  background: none;
+  color: var(--text-dim);
+  border: 1px solid var(--edge);
+  border-radius: 3px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  font-family: system-ui, sans-serif;
+}
+
+.pick-btn:hover { color: var(--text); }
+.pick-btn.on {
+  color: var(--ink);
+  background: var(--route);
+  border-color: var(--route);
+}
+
+/* One slider with both ends on it. Two inputs share a track; only their
+   thumbs take the pointer, so whichever one you grab is the one that moves. */
+.range { position: relative; height: 28px; margin: 6px 0 2px; }
+
+.range-track {
+  position: absolute;
+  left: 0; right: 0; top: 12px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--edge);
+}
+
+.range-fill {
+  position: absolute;
+  top: 0; bottom: 0;
+  border-radius: 2px;
+  background: var(--route);
+}
+
+.range input[type=range] {
+  position: absolute;
+  left: 0; right: 0; top: 0;
+  width: 100%;
+  margin: 0;
+  height: 28px;
+  background: none;
+  pointer-events: none;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.range input[type=range]::-webkit-slider-thumb {
+  pointer-events: auto;
+  -webkit-appearance: none;
+  width: 15px; height: 15px;
+  border-radius: 50%;
+  background: var(--route);
+  border: 2px solid var(--panel);
+  cursor: pointer;
+}
+
+.range input[type=range]::-moz-range-thumb {
+  pointer-events: auto;
+  width: 13px; height: 13px;
+  border-radius: 50%;
+  background: var(--route);
+  border: 2px solid var(--panel);
+  cursor: pointer;
+}
+
+/* Thickness and outline are set once and then left alone, so they fold away
+   under the things that get touched every session. */
+details.fold {
+  margin-top: 14px;
+  border-top: 1px solid var(--rule);
+  padding-top: 8px;
+}
+
+details.fold > summary {
+  cursor: pointer;
+  list-style: none;
+  font-size: 12px;
+  color: var(--text-dim);
+  font-family: system-ui, sans-serif;
+}
+
+details.fold > summary::-webkit-details-marker { display: none; }
+details.fold > summary::before { content: '▸'; margin-right: 7px; }
+details.fold[open] > summary::before { content: '▾'; }
+details.fold > summary:hover { color: var(--text); }
+
+/* The edge margin for "keep me in view". Invisible until the slider is
+   touched: it is a boundary you set once, not something to look at while
+   reading the map. */
+.follow-box {
+  position: absolute;
+  inset: 90px;
+  border: 3px dashed var(--route);
+  border-radius: 4px;
+  /* A hairline of amber over painted terrain reads as part of the map. The
+     dark ring on both sides, and a wash of shadow beyond it, are what make
+     the boundary legible over anything. */
+  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.55),
+              inset 0 0 0 2px rgba(0, 0, 0, 0.55),
+              0 0 0 9999px rgba(0, 0, 0, 0.22);
+  z-index: 800;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.25s ease;
+}
+
+.follow-box.show { opacity: 0.95; }
+
+/* While you are saying where a dungeon belongs, the map is a thing to point
+   at rather than a thing to drag. */
+#map.placing, #map.placing .leaflet-grab { cursor: crosshair; }
+
+/* Naming a place, from its own popup. */
+.naming { display: flex; gap: 6px; margin: 8px 0 2px; }
+
+.naming input {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 7px;
+  background: var(--ink);
+  color: var(--text);
+  border: 1px solid var(--edge);
+  border-radius: 3px;
+  font: inherit;
+  font-size: 13px;
+  font-family: system-ui, sans-serif;
+}
+
+.naming input::placeholder { color: var(--text-dim); }
+.naming input:focus { outline: 1px solid var(--route); border-color: var(--route); }
+.naming .ghost { margin-top: 0; }
+
+/* What the route adds up to. Two columns, the number on the right in tabular
+   figures so the digits line up down the panel. */
+.stats { display: flex; flex-direction: column; gap: 1px; }
+
+.stats div {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 3px 0;
+  font-size: 13px;
+  font-family: system-ui, sans-serif;
+}
+
+.stats span { color: var(--text-dim); }
+
+.stats b {
+  margin-left: auto;
+  font-weight: 400;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The playback mark. Brighter and plainer than the live position, because it
+   is a thing being replayed rather than where you are. */
+.play-mark {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: absolute;
+  border-radius: 50%;
+  color: #fff3d6;
+  background: rgba(224, 163, 60, 0.9);
+  border: 2px solid #fff3d6;
+  box-shadow: 0 0 10px rgba(224, 163, 60, 0.8);
+  font-size: 8px;
+  pointer-events: none;
+}
+
+/* --- playback -------------------------------------------------------------
+
+   The button is the first thing in the panel and the only one styled like a
+   thing to press rather than a setting to adjust. Everything else playback
+   needs is on the map, because that is where it is happening: a bar along the
+   bottom and a toll at the top.
+   ------------------------------------------------------------------------ */
+
+#playback-box { padding-top: 0; border-top: 0; }
+
+.play-btn {
+  width: 100%;
+  padding: 11px 12px;
+  font: inherit;
+  font-size: 14px;
+  letter-spacing: 0.01em;
+  color: var(--ink);
+  background: linear-gradient(180deg, #f0b755, var(--route));
+  border: 1px solid #f6cc82;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.play-btn:hover { filter: brightness(1.08); }
+.play-btn:disabled { filter: grayscale(0.6) brightness(0.8); cursor: default; }
+
+/* The same button stops it again. In the death red rather than the route's
+   amber: it is the way out of a mode that has taken the whole map over, and
+   the one control that has to be findable without hunting for it. */
+.play-btn.on {
+  color: #ff8a72;
+  background: rgba(216, 97, 58, 0.14);
+  border-color: rgba(255, 138, 114, 0.55);
+}
+
+.play-btn.on:hover {
+  background: rgba(216, 97, 58, 0.24);
+  border-color: #ff8a72;
+  filter: none;
+}
+
+/* The bar is flush to the bottom and to both edges of the map, so the track
+   inside it measures the whole route against the whole screen -- an inset
+   panel would have made the timeline one control among several. */
+#timeline {
+  position: absolute;
+  left: 348px;
+  right: 0;
+  bottom: 0;
+  z-index: 900;
+  padding: 0 0 9px;
+  background: linear-gradient(180deg,
+              rgba(14, 12, 9, 0.72), rgba(14, 12, 9, 0.95) 45%);
+  border-top: 1px solid var(--edge);
+  backdrop-filter: blur(3px);
+}
+
+.play-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  min-height: 40px;
+  padding: 4px 18px 0;
+}
+
+#play-clock {
+  margin: 0;
+  min-width: 0;
+  /* Never as far as the transport, whatever the numbers grow to. */
+  max-width: calc(50% - 220px);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.35;
+}
+
+#play-when, #play-pos {
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#play-when { font-weight: 400; color: var(--text); }
+#play-pos { font-size: 11px; color: var(--text-dim); }
+
+.play-row #play-died { margin: 0 0 0 auto; flex: none; }
+
+/* Out of flow, so the clock on one side and the button on the other cannot
+   push the play button off the middle of the map. */
+.play-mid {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* The slider and the label are the same width, so what sits between them is
+   centred and the play button lands on the map's middle. */
+#play-speed { width: 124px; margin: 0; flex: none; }
+#play-rate {
+  width: 124px;
+  flex: none;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+/* The track is the full width of the map. Chrome cannot fill the part of a
+   range input behind the thumb on its own, so the played part is painted as
+   a gradient stop that `playClockText()` moves. */
+.play-track { position: relative; height: 40px; }
+
+/* Where the deaths are. The thumb travels between its own half-widths, so a
+   tick is inset by the same 7px to line up with it. Never takes a click: the
+   whole width of the track has to stay seekable. */
+#play-ticks {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+#play-ticks i {
+  position: absolute;
+  top: 13px;
+  width: 1px;
+  height: 14px;
+  background: #ff6a4d;
+}
+
+/* Over the drawn path the cursor is a thing you can press, not a thing you
+   can drag. `#map` is the Leaflet container, so this outranks the plain
+   `.leaflet-container` and `.leaflet-grab` rules without shouting. */
+#map.on-path, #map.on-path .leaflet-grab, #map.on-path .leaflet-interactive {
+  cursor: pointer;
+}
+
+/* Where the path under the cursor sits on the timeline. Taller and brighter
+   than a death tick because it answers a question you are asking right now,
+   with the moment written above it, over the map. */
+#play-hover {
+  position: absolute;
+  top: 5px;
+  width: 2px;
+  height: 30px;
+  margin: 0;
+  padding: 0;
+  background: var(--route);
+  border: 0;
+  border-radius: 1px;
+  box-shadow: 0 0 8px rgba(224, 163, 60, 0.9);
+  cursor: pointer;
+}
+
+#play-hover::after {
+  content: attr(data-when);
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  white-space: nowrap;
+  padding: 4px 8px;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+  background: var(--route);
+  border-radius: 3px;
+  pointer-events: none;
+}
+
+/* No glow. A 1px line with a 3px shadow is a 7px line, and 130 deaths bunched
+   into the recent sessions then read as one solid red band rather than as the
+   deaths they are. Crisp, they stay countable where they are countable and
+   honestly dense where they are dense. */
+
+#play-scrub {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  background: none;
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+#play-scrub::-webkit-slider-runnable-track {
+  height: 8px;
+  background: linear-gradient(90deg,
+              var(--route) 0 var(--done, 0%),
+              rgba(255, 255, 255, 0.13) var(--done, 0%));
+}
+
+#play-scrub::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  margin-top: -3px;
+  border-radius: 50%;
+  background: var(--route);
+  border: 2px solid #17130e;
+  cursor: pointer;
+}
+
+#play-scrub::-moz-range-track { height: 8px; background: rgba(255,255,255,0.13); }
+#play-scrub::-moz-range-progress { height: 8px; background: var(--route); }
+#play-scrub::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--route);
+  border: 2px solid #17130e;
+  cursor: pointer;
+}
+
+/* Above the track rather than on it. Sitting on it covered the one thing the
+   bar is for, and took every click over the middle tenth of the route with
+   it; there is nothing over the track now, so the whole width seeks. */
+.play-transport {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.play-transport button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  padding: 0;
+  font: inherit;
+  line-height: 1;
+  background: none;
+  border: 0;
+  border-radius: 50%;
+  cursor: pointer;
+}
+
+.play-transport .step {
+  width: 28px;
+  height: 28px;
+  font-size: 19px;
+  color: var(--text-dim);
+}
+
+.play-transport .step:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.09);
+}
+
+/* Amber while paused, because then it is the thing to press; quiet while it
+   is running, when the route is what you are meant to be looking at. */
+#play-toggle {
+  width: 38px;
+  height: 38px;
+  font-size: 15px;
+  color: var(--ink);
+  background: var(--route);
+}
+
+#play-toggle:hover { filter: brightness(1.1); }
+
+#play-toggle.on {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.13);
+}
+
+/* Deaths so far. Top centre of the map rather than in the panel: it is about
+   what is happening out there, and it has to be findable without looking
+   away from the path being drawn. */
+#toll {
+  position: absolute;
+  top: 16px;
+  left: calc(174px + 50%);
+  transform: translateX(-50%);
+  z-index: 900;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 7px 14px 8px;
+  background: rgba(14, 12, 9, 0.8);
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  pointer-events: none;
+}
+
+#toll .skull { font-size: 15px; color: #ff8a72; }
+#toll b {
+  font-size: 19px;
+  font-weight: 400;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+#toll i {
+  font-style: normal;
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+/* A death has to register while you are looking at the other end of the map,
+   at a speed where it is on screen for a fiftieth of a second. So the whole
+   badge answers rather than just the number: the pill flares red and throws a
+   glow, the count punches out and settles back, and the skull kicks. Six
+   hundred milliseconds, which is under the gap between two deaths even in the
+   worst stretch of routes.db played at an hour a second.
+
+   Nothing here animates `transform` on #toll itself -- that is where its own
+   `translateX(-50%)` lives, and a keyframe would beat the inline style and
+   throw the badge off centre. */
+#toll.bump { animation: toll-flash 600ms ease-out; }
+#toll.bump b { animation: toll-bump 600ms cubic-bezier(0.2, 0.9, 0.25, 1); }
+#toll.bump .skull { animation: toll-skull 600ms ease-out; }
+
+@keyframes toll-flash {
+  0% {
+    background: rgba(14, 12, 9, 0.8);
+    border-color: var(--edge);
+    box-shadow: none;
+  }
+  12% {
+    background: rgba(216, 97, 58, 0.55);
+    border-color: #ff8a72;
+    box-shadow: 0 0 0 4px rgba(216, 97, 58, 0.32),
+                0 0 20px rgba(216, 97, 58, 0.65);
+  }
+  100% {
+    background: rgba(14, 12, 9, 0.8);
+    border-color: var(--edge);
+    box-shadow: none;
+  }
+}
+
+@keyframes toll-bump {
+  0%   { transform: scale(1);    color: var(--text); }
+  18%  { transform: scale(1.85); color: #ffd2c6; }
+  55%  { transform: scale(0.97); color: #ff8a72; }
+  100% { transform: scale(1);    color: var(--text); }
+}
+
+@keyframes toll-skull {
+  0%   { transform: scale(1) rotate(0deg); }
+  20%  { transform: scale(1.55) rotate(-14deg); }
+  60%  { transform: scale(1.12) rotate(7deg); }
+  100% { transform: scale(1) rotate(0deg); }
+}
+
+/* While playing, the dungeon pins stay on the map as landmarks but stop
+   taking the hover: the playback is already driving the interior overlay and
+   two things steering it fight. */
+/* The pins the playback puts up are its own, and they are found rather than
+   listed, so they are not dimmed the way the map's permanent ones were. */
+body.playing .cave-mark { cursor: default; }
+
+/* The caption and the timeline both want the bottom of the map. The caption
+   moves up out of the way rather than the bar moving down, because the bar is
+   the thing you are reaching for. */
+body.playing #caption { bottom: 104px; }
+
+/* The places that are nowhere. Bottom-left of the map area, out of the way of
+   the caption in the middle, and lifted over the timeline while it is up. */
+#offmap {
+  position: absolute;
+  left: calc(348px + 18px);
+  bottom: 18px;
+  z-index: 700;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+body.playing #offmap { bottom: 104px; }
+
+/* A disc, like the marks on the map, because that is what it stands in for:
+   a place you would click. The name will not fit inside one, so it slides out
+   beside it on hover and is on the button for a screen reader either way. */
+#offmap button {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 52px;
+  height: 52px;
+  margin: 0;
+  padding: 0;
+  font: inherit;
+  font-size: 25px;
+  line-height: 1;
+  color: #fff3d6;
+  background: rgba(224, 163, 60, 0.92);
+  border: 2px solid #fff3d6;
+  border-radius: 50%;
+  box-shadow: 0 0 10px rgba(224, 163, 60, 0.55);
+  cursor: pointer;
+}
+
+#offmap button:hover {
+  background: var(--route);
+  box-shadow: 0 0 14px rgba(224, 163, 60, 0.85);
+}
+
+#offmap button::after {
+  content: attr(data-name);
+  position: absolute;
+  left: calc(100% + 8px);
+  white-space: nowrap;
+  padding: 5px 10px;
+  font-size: 12.5px;
+  color: var(--text);
+  background: rgba(8, 32, 33, 0.94);
+  border: 1px solid var(--edge);
+  border-radius: 3px;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+  pointer-events: none;
+}
+
+#offmap button:hover::after, #offmap button:focus-visible::after { opacity: 1; }
+
+/* A death or a teleport arriving. Two rings out of one point, the second
+   half a beat behind, with the glyph swelling and fading over the top. Long
+   enough to catch the eye at 5 minutes a second, short enough not to still
+   be going when the next one lands. */
+/* A mark arriving.
+   Not a ring: it starts too small to see, overshoots the size it will settle
+   at, and comes back to it -- so the thing that catches your eye is the mark
+   itself rather than something drawn around it.
+
+   Which cannot be done on the icon element. Leaflet positions every marker by
+   writing `transform: translate3d(...)` on it, so a keyframe setting
+   `transform` there beats the inline style and the mark is scaled beautifully
+   at the corner of the pane. The `scale` property is no good either, despite
+   composing rather than replacing: individual transform properties apply
+   *before* `transform`, so the translate is scaled with everything else and
+   the mark slides -- measured, 23 px across the screen at 1.5x on a marker
+   47 px from its pane's origin.
+
+   So a playback mark is wrapped. The holder is what Leaflet positions, the
+   thing inside it is the mark you can see, and the pop scales that. */
+.pop-holder { position: absolute; }
+.pop-holder > * { position: absolute; inset: 0; }
+
+.pop-holder.landed > * {
+  animation: mark-pop 420ms cubic-bezier(0.22, 0.9, 0.3, 1);
+}
+
+/* A pin is anchored at its tip rather than its middle, so it grows out of the
+   tip and the place it is naming stays where it is. */
+.pop-holder.landed > .cave-mark { transform-origin: 50% calc(100% + 7px); }
+
+@keyframes mark-pop {
+  0%   { transform: scale(0.05); }
+  52%  { transform: scale(1.5); }
+  100% { transform: scale(1); }
+}
+
+/* The one button on the timeline that writes something. Kept in the death's
+   own red so it does not read as another transport control. */
+#play-died { border-color: rgba(255, 138, 114, 0.45); color: #ff8a72; }
+#play-died:hover { border-color: #ff8a72; background: rgba(255, 138, 114, 0.12); }
+
+

@@ -1,0 +1,220 @@
+# Elden Ring Route Tracker configuration.
+#
+# The only section you must fill in yourself is [memory.pointers]. Everything
+# else has working defaults. Use --source sim until it is filled in.
+
+[recording]
+interval_s     = 0.50   # how often to poll the game
+min_move_m     = 1.5    # don't record until you've moved this far
+# Close the tracker when the game closes. The recorder is the viewer as well,
+# so this takes the map down with it -- set it false to keep the map up after
+# you quit, and stop the recorder yourself.
+stop_with_game = true
+max_speed_mps  = 40.0   # above this, treat it as a teleport and break the line
+idle_flush_s   = 5.0    # commit to disk at least this often
+# If the game cannot be read for this long -- a load screen, the map menu, an
+# alt-tab -- whatever comes back is somewhere you were put, not somewhere you
+# walked. A load screen normally announces itself and this is the backstop for
+# when it does not; without it a warp into a cave recorded the cave at the
+# grace you left from.
+blind_reload_s = 3.0
+
+# Starting the game as well as the recorder, for `record --launch` and the
+# Record route.bat launcher.
+[game]
+# Leave empty and it looks through your Steam libraries for
+# steamapps/common/ELDEN RING/Game, preferring start_game_in_offline_mode.exe
+# and falling back to eldenring.exe. Offline first because reading the game's
+# memory is only safe offline with anti-cheat off. Set this to override it --
+# a Steam shortcut, or start_protected_game.exe if you play with anti-cheat
+# on. Forward slashes.
+exe = ""
+# How long to wait for the game's process after starting it.
+launch_timeout_s = 180
+
+[maps]
+# Areas whose coordinates belong on the world map. 60 = Lands Between,
+# 61 = Shadow of the Erdtree.
+open_world_areas = [60, 61]
+tile_size_m      = 256.0
+
+# Areas that are a plane of the world rather than a room in it. 12 is the
+# underground rivers -- Siofra, Ainsel, Deeproot, Mohgwyn -- each its own map
+# with its own origin. Listed as dungeons they were drawn as legacy dungeons
+# lying on top of Limgrave.
+underground_areas = [12]
+
+# In an open-world area, Y below this means the shaft down to Siofra / Ainsel
+# rather than the surface. It catches the lift on the way down; the river
+# itself is its own map, above. Tune it once by standing in a shaft and
+# checking the height readout in the viewer.
+underground_y_max = -60.0
+
+# How to read the player's coordinates.
+#   "auto"       decide per reading from magnitude (safe default)
+#   "tile_local" relative to the tile named by the map ID; the tile's grid
+#                position gets added
+#   "absolute"   already world-wide; nothing is added
+position_space = "auto"
+
+# Interiors that are part of the visible world rather than hidden under it.
+# Stormveil, Raya Lucaria, Leyndell and the rest are drawn on the game's own
+# map, so their paths are drawn on ours too, always, instead of waiting for you
+# to hover the marker. They are still separate coordinate spaces -- the path is
+# drawn at the entrance and scaled in metres, and only its orientation is
+# unknown -- so this is about what is worth showing, not about where it is.
+# A cave has nothing to sit on top of, which is why caves are not in this list.
+# 34 is the Divine Towers: they stand on the surface like a legacy dungeon.
+# Add 39 if you want evergaols drawn the same way.
+world_visible_areas = [10, 11, 13, 14, 15, 16, 18, 19, 34]
+
+# An override for one underground map that does not share its area's frame.
+# Normally empty. Siofra (m12_07) and Nokron (m12_02) are one coordinate
+# space -- crossing between them moves the local coordinates by the metres you
+# walked -- so the area origin below places both, and everything else in
+# area 12 until one of them disagrees. The recorder says so if one does.
+[maps.map_origin]
+
+# Slides the DLC map beside the base map so both fit on one plane. Set the
+# second pair once you have a Shadow of the Erdtree map image placed.
+[maps.area_origin]
+60 = [0.0, 0.0]
+61 = [20000.0, 0.0]
+# The underground rivers. Measured 2026-09-06 from the Siofra River Well lift,
+# where the last reading in the shaft, world (11616.4, 9486.2), is the first
+# reading below at Siofra local (737.5, 1165.0). Walking into a river with no
+# origin makes the recorder print the line to add.
+12 = [10878.94, 8321.17]
+
+# Discrete interiors. Any area number that appears here is treated as its own
+# coordinate space and drawn as a marker, not a path. Anything NOT listed gets
+# reported once in the console as "unclassified area N" so you can add it as
+# you encounter it -- that beats me guessing at numbers.
+# What a particular map is called, where the area label cannot say it. Area
+# 11 is "Legacy Dungeon" for all of Leyndell, and the Roundtable Hold is in it
+# -- so without this the one place in the route that is nowhere in the world
+# was also the one with the least useful name on it. A name you give a map
+# yourself still wins over both.
+[maps.map_labels]
+"m11_10_00_00" = "Roundtable Hold"
+"m10_01_00_00" = "Chapel of Anticipation"
+
+[maps.area_labels]
+30 = "Catacombs"
+31 = "Cave"
+32 = "Tunnel"
+34 = "Divine Tower"
+35 = "Hero's Grave"
+39 = "Evergaol"
+10 = "Legacy Dungeon"
+11 = "Legacy Dungeon"
+13 = "Legacy Dungeon"
+14 = "Legacy Dungeon"
+15 = "Legacy Dungeon"
+16 = "Legacy Dungeon"
+18 = "Legacy Dungeon"
+19 = "Legacy Dungeon"
+
+# World metres -> map image pixels. Produced by tools/calibrate.py; the
+# defaults below are a placeholder that just shows metres as pixels.
+[projection]
+scale_x  = 0.995653
+offset_x = -6991.374
+scale_y  = -1.004961
+offset_y = 16559.696
+
+# worst point 1.1 px off
+# paste into config.toml, replacing the old block, then restart the tracker
+
+[viewer]
+title          = "Route"
+tile_url       = "/tiles/{z}/{x}/{y}.webp"
+# The Underground button swaps to this one. Siofra, Ainsel and Deeproot are at
+# the same world coordinates as the surface above them, so the same
+# [projection] draws a route on either image -- what has to match is the
+# image: same crop, same scale, same pixel size. Built with
+#   python tools/make_tiles.py m1-underground.png --out viewer/tiles-underground
+underground_tile_url = "/tiles-underground/{z}/{x}/{y}.webp"
+tile_min_zoom  = 0
+tile_max_zoom  = 6
+image_width    = 9728      # size of the source map image you tiled
+image_height   = 9216
+keep_buffer    = 4         # preload this many tile rings outside the viewport
+
+[memory]
+process_name = "eldenring.exe"
+
+# Byte offsets within the resolved structures.
+[memory.field_offsets]
+x      = 0x0
+y      = 0x4
+z      = 0x8
+map_id = 0x0
+
+# --------------------------------------------------------------------------
+# SIGNATURES
+#
+# Values below are derived from veeenu's Elden Ring practice tool
+# (xtask/src/codegen/aob_scans.rs for the patterns, lib/libeldenring/src/
+# pointers.rs for the offset chains). They are correct for game versions up
+# to 2.07.0.
+#
+# The AOB pattern normally survives patches; the raw offsets in `chain` do
+# NOT. If `probe` resolves the pattern but the numbers look wrong, pull fresh
+# offsets from that repo and update `chain` only.
+#
+# Verify with:  python -m tracker.main probe
+#
+#   pattern            byte signature, ?? for wildcards
+#   rip_offset         where the 4-byte displacement starts in the match
+#   instruction_length length of the instruction holding it
+#   chain              offsets to walk; all but the last are dereferenced
+# --------------------------------------------------------------------------
+
+# WorldChrMan -> PlayerIns -> global position.
+#
+# This is deliberately NOT the practice tool's `chunk_position`. That one is
+# the physics position, whose origin the game rebases every few seconds so
+# float precision doesn't degrade across a huge world -- it sawtooths, and a
+# route drawn from it resets every few seconds.
+#
+# `global_position` (0x6C0) sits in the same struct as the map ID (0x6D0) and
+# is the pair meant to be read together.
+[memory.pointers.player_position]
+pattern            = "48 8B 05 ?? ?? ?? ?? 48 85 C0 74 0F 48 39 88"
+rip_offset         = 3
+instruction_length = 7
+# 0x1E508 = PlayerIns (0x18468 before 1.07)
+# 0x6C0 = global position x; y and z follow at +4 and +8
+# (0x6B8 on 1.02-1.03, 0x6B0 on 1.04-1.07)
+chain              = [0x1E508, 0x6C0]
+
+# The rebasing physics position, kept for reference. Do not use it for routes.
+# [memory.pointers.player_position]
+# chain            = [0x1E508, 0x190, 0x68, 0x70]
+
+# WorldChrMan -> the local player's HP.
+#
+# Optional. Without it everything works except death marks; with it, HP
+# dropping to zero puts a mark where you fell. Taken from the practice tool's
+# `character_points` chain (lib/libeldenring/src/pointers.rs), which reads the
+# player through net_players_ins rather than PlayerIns: net_players_ins is
+# 0x10EF8 on 1.07 and later, entry 0 is you, and hp is the first field of the
+# CharacterPoints struct at +0x138.
+#
+# Verify before trusting it:  python -m tracker.main probe
+# It prints HP alongside each reading. If the number is not your health,
+# comment this block out -- nothing else depends on it.
+[memory.pointers.player_hp]
+pattern            = "48 8B 05 ?? ?? ?? ?? 48 85 C0 74 0F 48 39 88"
+rip_offset         = 3
+instruction_length = 7
+chain              = [0x10EF8, 0x0, 0x190, 0x0, 0x138]
+
+# WorldChrMan -> PlayerIns -> map ID.
+[memory.pointers.map_id]
+pattern            = "48 8B 05 ?? ?? ?? ?? 48 85 C0 74 0F 48 39 88"
+rip_offset         = 3
+instruction_length = 7
+# 0x6D0 on 1.08 and later; 0x6C0 on 1.04-1.07; 0x6C8 on 1.02-1.03
+chain              = [0x1E508, 0x6D0]
