@@ -23,7 +23,7 @@ const state = {
   livePlane: null,    // the plane the recorder last reported, to follow it
   autoPlane: true,    // and whether the map follows the route between the two
   peek: false,        // looking at the world from inside a cave, on purpose
-  layers: { interior: true },
+  layers: { interior: true, legacy: false },
   deaths: true,       // death marks are their own layer, not a route layer
   respawns: true,     // and where you got up afterwards
   respawnList: [],    // every respawn, for the dungeon drawings to read
@@ -248,7 +248,7 @@ const BREAK_RELOAD = 3;
 // null: wireControls() threw on the first missing checkbox, boot() never
 // reached reload(), and the result was a blank map whose buttons did nothing
 // -- with no clue that the page itself was half a version old.
-const PAGE_BUILD = 65;
+const PAGE_BUILD = 66;
 
 async function boot() {
   checkPageBuild();
@@ -991,6 +991,12 @@ async function loadInteriors() {
   buildOffMap(data.unplaced || []);
 
   for (const group of byAnchor.values()) {
+    // A legacy dungeon is drawn out in the open at all times, so its pin
+    // is a separate question from a cave's: taking it off leaves the
+    // castle and its path exactly where they are. Off by default. The
+    // guard is here rather than beside `mark.addTo()` so the second-mouth
+    // pins below it go with it -- they are the same place.
+    if (group[0].world_visible && !state.layers.legacy) continue;
     // Hovering can only show one visit, so it should be the one worth seeing:
     // stepping in and straight back out leaves a three-second visit on the
     // same dungeon as the hour you actually spent down there. A visit whose
@@ -4927,7 +4933,8 @@ function togglePlayback() {
 // changes nothing you can see. Off rather than absent, so the section still
 // says what the map will look like when you come back to it.
 function playLockMarks(on) {
-  for (const id of ['l-interior', 'l-deaths', 'l-respawns', 'l-warps']) {
+  for (const id of ['l-interior', 'l-legacy', 'l-deaths', 'l-respawns',
+                    'l-warps']) {
     const el = document.getElementById(id);
     if (el) el.disabled = on;
   }
@@ -5865,6 +5872,15 @@ function wireControls() {
   rememberToggle('l-interior', 'interior', (on, first) => {
     state.layers.interior = on;
     if (!first) scheduleReload(0);
+  });
+
+  // Only the pin. loadInteriors() draws the markers and then hands the
+  // legacy dungeons to drawWorldVisible() either way, so the castles keep
+  // their paths -- which is the whole point of the switch being separate
+  // from the one above it.
+  rememberToggle('l-legacy', 'legacy', (on, first) => {
+    state.layers.legacy = on;
+    if (!first) loadInteriors();
   });
 
   // Surface or underground: one map or the other, not two layers stacked.

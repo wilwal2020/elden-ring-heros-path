@@ -7,7 +7,7 @@
      controls this page declares. Bumped together whenever a control is added,
      so a browser holding one and not the other says so instead of dying on
      the first missing element. -->
-<meta name="page-build" content="65">
+<meta name="page-build" content="66">
 <title>Tarnished Path</title>
 <link rel="stylesheet" href="vendor/leaflet.css">
 <link rel="stylesheet" href="style.css">
@@ -213,6 +213,10 @@
   <section id="sec-markers">
     <h2>Markers</h2>
     <label class="toggle"><input type="checkbox" id="l-interior" checked> Caves and dungeons</label>
+    <!-- Only the icon: the castle stays drawn on the map either way.
+         Off by default, because the place is already there to see and
+         the pin is one more thing standing on it. -->
+    <label class="toggle"><input type="checkbox" id="l-legacy"> Legacy dungeons</label>
     <label class="toggle"><input type="checkbox" id="l-deaths" checked> Deaths</label>
     <label class="toggle"><input type="checkbox" id="l-respawns" checked> Where you respawned</label>
     <label class="toggle"><input type="checkbox" id="l-warps" checked> Teleports</label>
@@ -238,10 +242,10 @@
                 aria-expanded="false"><span class="now">By elevation</span>
           <i class="caret" aria-hidden="true"></i></button>
         <div class="picker-list" role="listbox" hidden>
-          <button type="button" role="option" data-value="height"
-                  data-label="By elevation">By elevation<b>&#10003;</b></button>
           <button type="button" role="option" data-value="age"
                   data-label="By age">By age<b>&#10003;</b></button>
+          <button type="button" role="option" data-value="height"
+                  data-label="By elevation">By elevation<b>&#10003;</b></button>
           <button type="button" role="option" data-value="solid"
                   data-label="One colour">One colour<b>&#10003;</b></button>
         </div>

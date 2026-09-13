@@ -1076,25 +1076,13 @@ body.playing #inset.from-corner {
 .pick-btn:hover { color: var(--text); border-color: #2f6664; }
 
 .pick-btn.on {
-  color: #ffe6b8;
-  border-color: rgba(224, 163, 60, 0.55);
-  background: linear-gradient(180deg,
-              rgba(224, 163, 60, 0.16), rgba(224, 163, 60, 0.04));
+  color: var(--ink);
+  background: var(--route);
+  border-color: var(--route-hi);
 }
 
+.pick-btn.on:hover { color: var(--ink); background: var(--route-hi); }
 .pick-btn.on svg { opacity: 1; }
-
-/* Lit along its foot, so the plate you are standing on says so twice. */
-.pick-btn.on::after {
-  content: '';
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  height: 2px;
-  background: linear-gradient(90deg,
-              var(--route), rgba(224, 163, 60, 0.25));
-}
 
 /* One slider with both ends on it. Two inputs share a track; only their
    thumbs take the pointer, so whichever one you grab is the one that moves. */
@@ -1149,14 +1137,10 @@ body.playing #inset.from-corner {
 /* Thickness and outline are set once and then left alone, so they fold away
    under the things that get touched every session. */
 details.fold {
-  margin: 12px 0 4px;
-  background: rgba(8, 32, 33, 0.45);
-  border: 1px solid var(--rule-soft);
-  border-radius: 7px;
+  margin: 14px 0 4px;
+  border-top: 1px solid var(--rule-soft);
+  padding-top: 8px;
 }
-
-details.fold > div, details.fold > .slider { margin-left: 10px; margin-right: 10px; }
-details.fold > .slider:last-child { margin-bottom: 9px; }
 
 /* It folds away because it is set once and then left alone -- but at 12px of
    --text-dim under a section of controls that are all brighter than it, it
@@ -1168,8 +1152,8 @@ details.fold > summary {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin: 0;
-  padding: 8px 10px;
+  margin: 0 -8px;
+  padding: 6px 8px;
   border: 1px solid transparent;
   border-radius: 4px;
   cursor: pointer;
@@ -1324,8 +1308,7 @@ details.fold > summary:hover {
   background: linear-gradient(180deg, var(--acc-hi), var(--acc));
   border: 0;
   border-radius: 999px;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.4),
-              0 3px 16px rgba(224, 163, 60, 0.25);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.4);
   cursor: pointer;
   transition: filter 0.14s ease, box-shadow 0.16s ease;
 }
@@ -1359,11 +1342,10 @@ details.fold > summary:hover {
    amber: it is the way out of a mode that has taken the whole map over, and
    the one control that has to be findable without hunting for it. */
 .play-btn.on {
-  --acc: #d8613a;
-  --acc-hi: #ff8a72;
-  --on-acc: #1f1210;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.3),
-              0 3px 16px rgba(216, 97, 58, 0.25);
+  --acc: #ec4444;
+  --acc-hi: #ec4444;
+  --on-acc: #2a0f0d;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22);
 }
 
 /* The bar is flush to the bottom and to both edges of the map, so the track

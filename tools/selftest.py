@@ -2900,6 +2900,20 @@ def main() -> int:
               'id="numbers"' in html and "function buildStats" in page)
         check("the panel calls it respawning",
               "Where you respawned" in html and "Where you got up" not in html)
+        # A legacy dungeon is drawn out in the open at all times, so whether it
+        # also wears a pin is a different question from whether a cave does --
+        # and answering it must not take the castle's path off with the icon.
+        # Off by default: the place is already there to see.
+        check("a legacy dungeon's pin is its own switch, and only the pin",
+              'id="l-legacy"' in html
+              and 'id="l-legacy" checked' not in html
+              and "rememberToggle('l-legacy', 'legacy'" in page
+              and "if (group[0].world_visible && !state.layers.legacy) continue;"
+                  in page
+              and "state.layers.legacy = on;" in page
+              # The pins and nothing else: the castles are put back on the map
+              # by drawWorldVisible(), which this does not reach.
+              and "if (!first) loadInteriors();" in page)
         check("the session list can be expanded rather than growing forever",
               'id="more-sessions"' in html)
         # Playing one session back is the two grips plus repeat on the axis the
@@ -3886,7 +3900,7 @@ def main() -> int:
         stop = bare[bare.index(".play-btn.on {"):]
         stop = stop[:stop.index("}")]
         check("the button that stops the playback is red",
-              "#ff8a72" in stop)
+              "#ec4444" in stop)
         check("a teleport plays as going from one place to the other",
               "function playTravel(" in page
               and "const PLAY_TRAVEL_MS = 420;" in page
