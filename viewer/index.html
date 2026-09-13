@@ -7,8 +7,8 @@
      controls this page declares. Bumped together whenever a control is added,
      so a browser holding one and not the other says so instead of dying on
      the first missing element. -->
-<meta name="page-build" content="51">
-<title>Route</title>
+<meta name="page-build" content="65">
+<title>Tarnished Path</title>
 <link rel="stylesheet" href="vendor/leaflet.css">
 <link rel="stylesheet" href="style.css">
 </head>
@@ -50,6 +50,12 @@
 
 <p id="caption" hidden></p>
 
+<!-- While you are in a cave the world is dimmed and the cave is drawn over
+     it, which is what you want right up until you want to see where the cave
+     is. Top centre of the map, because it is about what is on the map and it
+     has to be findable without looking away from it. -->
+<button id="peek" hidden></button>
+
 <div id="inset" hidden>
   <header>
     <div>
@@ -60,10 +66,12 @@
             aria-label="Close">&#10005;</button>
   </header>
   <canvas id="inset-canvas" width="352" height="352"></canvas>
-  <!-- The figures as figures rather than as a sentence: four things you read
-       at a glance instead of one line you parse. -->
-  <dl id="inset-figures"></dl>
   <p id="inset-stats" class="hint"></p>
+  <!-- For a place with no position on the map: no marker, so no popup, so
+       every visit to it lives here, on the window the corner button opens.
+       Folded away, because the shape of the place is what the window is for
+       and a list of times you went there is a thing you go looking for. -->
+  <div id="inset-offmap" hidden></div>
 </div>
 
 <!-- Both of these belong to the map rather than the panel: they are only up
@@ -90,6 +98,17 @@
     <!-- One thin red line per death, so the timeline says where they are
          before you get to them. Under the thumb, over the track. -->
     <div id="play-ticks" aria-hidden="true"></div>
+    <!-- What part of the route the playback runs. The whole track stays a
+         picture of everything recorded; these two say where the playback
+         starts and ends, and the route outside them is shaded out. -->
+    <div id="play-trim">
+      <div class="cut" id="trim-cut-a" aria-hidden="true"></div>
+      <div class="cut" id="trim-cut-b" aria-hidden="true"></div>
+      <button class="grip" id="trim-a" title="Where the playback starts"
+              aria-label="Where the playback starts"></button>
+      <button class="grip" id="trim-b" title="Where the playback ends"
+              aria-label="Where the playback ends"></button>
+    </div>
     <!-- Where the bit of path under the cursor happened. Pressing it goes
          there. -->
     <button id="play-hover" hidden></button>
@@ -102,19 +121,50 @@
       <b id="play-when"></b><span id="play-pos"></span>
     </div>
     <!-- Centred on the map, so the play button lands under the middle of the
-         timeline it drives, with the speed either side of it. -->
+         timeline it drives, with the speed on one side of it and an empty
+         element of the same width on the other. -->
     <div class="play-mid">
-      <input type="range" id="play-speed" min="0" max="13" step="1" value="6"
-             aria-label="How much faster than you walked it">
+      <!-- The reading belongs to the slider, not to the far side of the play
+           button. What it means in minutes is on hover. -->
+      <div class="play-speed">
+        <input type="range" id="play-speed" min="0" max="13" step="1" value="6"
+               aria-label="How much faster than you walked it">
+        <span id="play-rate">&#215;300</span>
+      </div>
+      <!-- The two modes sit at the ends and the two steps beside the
+           toggle: reverse says which way the whole thing runs, so it belongs
+           with repeat and the deaths switch rather than in among the
+           controls that move one point at a time. -->
       <div class="play-transport">
+        <button id="play-rev" class="step" title="Play backwards (b)"
+                aria-label="Play backwards" aria-pressed="false"
+                >&#9194;&#65038;</button>
         <button id="play-back" class="step" title="One point back (,)"
                 aria-label="One point back">&#8249;</button>
         <button id="play-toggle" class="on" title="Pause (space)"
                 aria-label="Pause">&#9208;&#65038;</button>
         <button id="play-fwd" class="step" title="One point on (.)"
                 aria-label="One point on">&#8250;</button>
+        <!-- Run it again when it reaches the end grip, instead of stopping.
+             A mode rather than an action, so it stays lit while it is on. -->
+        <button id="play-repeat" class="step" title="Repeat (r)"
+                aria-label="Repeat when it reaches the end"
+                aria-pressed="false">&#8635;</button>
+        <!-- The red lines on the track. On by default, because knowing where
+             the deaths are before you reach them is most of what the bar is
+             for -- but a hundred and forty of them over one evening is a
+             wall, and then you want the route back. A mode like the two
+             beside it, which is why it stands with them. -->
+        <button id="play-ticks-on" class="skull-btn" aria-pressed="true"
+                aria-label="Show the deaths on the timeline"
+                title="Show the deaths on the timeline (t)"
+                >&#9760;&#65038;</button>
       </div>
-      <span id="play-rate">5 min a second</span>
+      <!-- How long is left, on the far side of the play button from the
+           speed that decides it. Exactly as wide as the speed group, so the
+           button still lands on the middle of the map -- which is what the
+           empty element that used to sit here was for. -->
+      <span id="play-left" class="play-left"></span>
     </div>
     <button id="play-died" class="ghost" title="Mark a death here (D)">I died
       here</button>
@@ -123,31 +173,44 @@
 
 <aside id="panel">
   <header>
-    <h1>Route</h1>
+    <h1>Tarnished Path</h1>
     <p id="status" class="status">Connecting</p>
   </header>
 
   <section id="playback-box">
-    <button id="play" class="play-btn">Play the route back</button>
-    <p class="hint">Clears the map and walks it again in the order you made
-      it, caves and deaths included. The same button stops it, and so does
-      Escape.</p>
+    <button id="play" class="play-btn"><i class="tri" aria-hidden="true"></i><i class="sq" aria-hidden="true"></i><span class="lbl">Route Playback</span></button>
   </section>
 
-  <section>
+  <!-- Every section in the panel folds away, and the heading is the
+       control: there is nothing else in a section that means "this section".
+       Remembered per section, under its id. -->
+  <section id="sec-map">
     <h2>Map</h2>
     <div class="choice">
-      <button id="plane-surface" class="pick-btn on">Surface</button>
-      <button id="plane-underground" class="pick-btn">Underground</button>
+      <button id="plane-surface" class="pick-btn on">
+        <svg viewBox="0 0 22 16" fill="none" stroke="currentColor"
+             stroke-width="1.4" aria-hidden="true">
+          <circle cx="7" cy="6" r="3.2"/>
+          <path d="M1 13 L7 9 L11 12 L16 7 L21 13" stroke-linejoin="round"/>
+        </svg>Surface</button>
+      <button id="plane-underground" class="pick-btn">
+        <svg viewBox="0 0 22 16" fill="none" stroke="currentColor"
+             stroke-width="1.4" aria-hidden="true">
+          <path d="M1 14 L1 8 A 10 8 0 0 1 21 8 L21 14"
+                stroke-linejoin="round"/>
+          <path d="M7 14 L7 11 A 4 3.5 0 0 1 15 11 L15 14"/>
+        </svg>Underground</button>
     </div>
     <label class="toggle"><input type="checkbox" id="auto-plane" checked>
-      Follow the route between maps</label>
-    <p class="hint" id="plane-note">Siofra, Ainsel and Deeproot run below the
-      Lands Between, so they are their own map rather than a layer on top of
-      it.</p>
+      Auto switch map</label>
+    <!-- Empty until there is something to report. swapTiles() writes the one
+         thing worth saying here -- that there is no underground pyramid built
+         yet -- and the two standing sentences that used to live in it said
+         the same thing every time you looked at them. -->
+    <p class="hint" id="plane-note" hidden></p>
   </section>
 
-  <section>
+  <section id="sec-markers">
     <h2>Markers</h2>
     <label class="toggle"><input type="checkbox" id="l-interior" checked> Caves and dungeons</label>
     <label class="toggle"><input type="checkbox" id="l-deaths" checked> Deaths</label>
@@ -155,27 +218,38 @@
     <label class="toggle"><input type="checkbox" id="l-warps" checked> Teleports</label>
   </section>
 
-  <section>
+  <section id="sec-follow">
     <h2>Follow</h2>
     <label class="toggle"><input type="checkbox" id="l-follow"> Keep me in view</label>
     <div class="slider"><span>Edge margin</span>
       <input type="range" id="follow-pad" min="0" max="100" step="1" value="25"></div>
-    <p class="hint" id="follow-label">How close to the edge of the screen you
-      can get before the map moves.</p>
+    <label class="toggle"><input type="checkbox" id="l-hold-spot">
+      Keep the same spot on a jump</label>
+    <p class="hint">During playback, a teleport that goes off screen puts
+      where it took you at the same place on the screen you left from, rather
+      than in the middle, so your eye does not have to move.</p>
   </section>
 
-  <section>
+  <section id="sec-path">
     <h2>The path</h2>
-    <div class="slider"><span>Type</span>
-      <select id="tint-mode">
-        <option value="height">By elevation</option>
-        <option value="age">By age</option>
-        <option value="solid">One colour</option>
-      </select></div>
+    <div class="slider"><span>Colour by</span>
+      <div class="picker" id="tint-mode" data-value="height">
+        <button type="button" class="picker-btn" aria-haspopup="listbox"
+                aria-expanded="false"><span class="now">By elevation</span>
+          <i class="caret" aria-hidden="true"></i></button>
+        <div class="picker-list" role="listbox" hidden>
+          <button type="button" role="option" data-value="height"
+                  data-label="By elevation">By elevation<b>&#10003;</b></button>
+          <button type="button" role="option" data-value="age"
+                  data-label="By age">By age<b>&#10003;</b></button>
+          <button type="button" role="option" data-value="solid"
+                  data-label="One colour">One colour<b>&#10003;</b></button>
+        </div>
+      </div></div>
     <div class="slider" id="colour-row" hidden><span>Line colour</span>
       <input type="color" id="line-colour" value="#e0a33c"></div>
     <div class="slider" id="age-depth-row" hidden><span>Oldest</span>
-      <input type="range" id="age-depth" min="0" max="9" step="1" value="0"></div>
+      <input type="range" id="age-depth" min="0" max="9" step="1" value="9"></div>
     <p class="hint" id="age-depth-label" hidden></p>
     <div id="ramp" class="ramp" hidden>
       <span id="ramp-low">low</span><i></i><span id="ramp-high">high</span>
@@ -189,19 +263,7 @@
     </details>
   </section>
 
-  <section id="unplaced-box" hidden>
-    <h2>Interiors with no place on the map</h2>
-    <p class="hint">Nothing recorded says where these are: either the
-      recording began inside, you only ever warped in and warped out, or you
-      said so yourself with <b>Take it off the map</b> &mdash; the Roundtable
-      Hold has no way in on foot at all. One row per visit, and one button in
-      the bottom-left corner of the map for the place. They get the inset
-      instead of a spot on the map picked at random &mdash; but if you know
-      where one belongs, <b>Put on map</b> and click it there.</p>
-    <div id="unplaced" class="sessions"></div>
-  </section>
-
-  <section>
+  <section id="sec-time">
     <h2>Time</h2>
     <p class="hint" id="range-label">Everything recorded</p>
     <div class="range">
@@ -212,17 +274,20 @@
     <button id="reset-time" class="ghost">Show everything</button>
   </section>
 
-  <section>
-    <h2>Numbers</h2>
+  <section id="sec-stats">
+    <h2>Statistics</h2>
     <div id="numbers" class="stats"></div>
   </section>
 
-  <section>
+  <section id="sec-sessions">
     <h2>Sessions</h2>
     <p class="hint">All sessions are drawn as one continuous path, newest
       first. Untick any you want hidden.</p>
     <div id="sessions" class="sessions"></div>
-    <button id="more-sessions" class="ghost" hidden></button>
+    <div class="row-buttons">
+      <button id="more-sessions" class="ghost" hidden></button>
+      <button id="fewer-sessions" class="ghost" hidden></button>
+    </div>
   </section>
 
   <section id="cal">

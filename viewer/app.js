@@ -9,12 +9,20 @@
  *      on the network.
  */
 
+// How many session rows stand before "Show more", and the floor "Show
+// fewer" comes back down to. Declared here rather than beside the other
+// constants two hundred lines down, because `state` reads it: a const is
+// in the temporal dead zone until its own line runs, and node --check
+// does not catch that.
+const SESSIONS_SHOWN = 6;
+
 const state = {
   meta: null,
   stalePage: false,   // index.html and app.js came from different versions
   plane: 'surface',   // 'surface' or 'underground': one map or the other
   livePlane: null,    // the plane the recorder last reported, to follow it
   autoPlane: true,    // and whether the map follows the route between the two
+  peek: false,        // looking at the world from inside a cave, on purpose
   layers: { interior: true },
   deaths: true,       // death marks are their own layer, not a route layer
   respawns: true,     // and where you got up afterwards
@@ -27,6 +35,9 @@ const state = {
   dungeonFrame: new Map(), // map id -> where its local coordinates sit
   follow: false,      // keep the live position on screen
   followPad: 90,      // and how far from the edge it is allowed to get, in px
+  // Where a jump that goes off screen puts you: in the middle, or at the same
+  // place on the screen you left from.
+  holdSpot: false,
   insideMap: null,    // the dungeon the recorder is in right now
   insideTimer: null,  // redraws that dungeon while you are still in it
   inset: null,
@@ -40,19 +51,26 @@ const state = {
   ageDepth: 0,        // index into AGE_DEPTHS: how far back the gradient runs
   mapDim: 0,          // how far the terrain is dimmed, 0 to 0.8
   drawn: [],          // the segments as last drawn, for playback to walk
+  hExtent: null,      // the height range they cover, for the legend
   span: null,         // [oldest, newest] timestamp drawn, for colouring by age
   quantiles: [],      // where the samples fall in time, evenly by count
-  shownSessions: 6,   // how many rows the session list shows before "more"
+  shownSessions: SESSIONS_SHOWN,   // rows shown before "Show more"
   range: null,
   live: [],
-  liveLayer: null,
+  liveT: [],          // when each of those points was walked, for the age ramp
+  liveRuns: [],       // the tail, one polyline per band
+  liveLayer: null,    // the run being appended to, or null to start a fresh one
+  tinted: [],         // stretches whose colour is a fact about now, not forever
+  tintedAt: 0,        // when they were last brought up to date
   // Local metres of the dungeon you are in, straight off the websocket. The
   // committed path lags: /api/interior only knows what the recorder has
   // written, and the overlay only asks every five seconds, so the position
   // mark -- which moves on every sample -- ran ahead of the line behind it.
   liveInside: [],
   liveInsideLine: null,
+  offmap: new Map(),  // visits to places with no position, by map id
   reloadTimer: null,
+  reloadMarks: false, // whether the queued reload has to rebuild the marks too
   drawnZoom: null,    // zoom level the drawn route was simplified for
 };
 
@@ -60,7 +78,7 @@ const renderer = L.canvas({ padding: 0.5 });
 let map, casingGroup, routeGroup, liveGroup, markerGroup, deathGroup,
     respawnGroup, warpGroup, insideGroup, insideLiveGroup, insideRenderer, arcRenderer,
     placedGroup, youMark,
-    tiles, baseTiles, baseOpts, tileOpts, followBox, followBoxTimer;
+    tiles, baseTiles, baseOpts, tileOpts, followBox;
 
 /* --- how the path is coloured -------------------------------------------- */
 
@@ -102,7 +120,19 @@ function ageRank(t) {
     const mid = (lo + hi) >> 1;
     if (q[mid] < t) lo = mid + 1; else hi = mid;
   }
-  return lo / (q.length - 1);
+  if (lo === 0) return 0;
+  // Between the two quantiles either side, by the clock, rather than the
+  // bucket the moment landed in. There are a hundred buckets, which is coarse
+  // enough to see: the playback measures every stretch against the playhead's
+  // own rank, so early on -- rankNow = 0.05 -- the ratio can only take six
+  // values, and every stretch on the map changes colour together each time
+  // that denominator ticks over. That is the snap. Inside one bucket the
+  // samples are evenly spaced by count, so splitting it by time is as close
+  // as this gets without sending every rank to the viewer, and the value at
+  // each quantile is unchanged.
+  const a = q[lo - 1], b = q[lo];
+  const f = b > a ? Math.max(0, Math.min(1, (t - a) / (b - a))) : 1;
+  return (lo - 1 + f) / (q.length - 1);
 }
 
 // How far back the gradient reaches. null is everything recorded; the rest
@@ -163,10 +193,15 @@ function bandOf(seg, i, lo, hi) {
   if (state.tint === 'height') {
     return Math.min(11, Math.floor(((seg.h[i] - lo) / (hi - lo)) * 12));
   }
-  if (state.tint === 'age') {
-    return Math.min(11, Math.floor(agePosition(seg.t[i]) * 12));
-  }
+  if (state.tint === 'age') return ageBand(seg.t[i]);
   return -1;                       // one colour: no banding to do
+}
+
+// Which band a moment falls in. Its own function because three things ask --
+// the route, the live tail and the pass that brings both up to date as the
+// ramp slides -- and they must not be able to disagree.
+function ageBand(t) {
+  return Math.min(11, Math.floor(agePosition(t) * 12));
 }
 
 function bandColor(band) {
@@ -201,7 +236,7 @@ function rampColor(t) {
 // What this page needs the recorder to speak. Kept next to the boot check
 // rather than hidden in a module, because the whole point is that someone
 // reading either half can see the pair.
-const NEEDS_API = 17;
+const NEEDS_API = 25;
 
 // Why the line broke, as the recorder reports it. 3 is a load screen, which
 // is the only sign of a respawn there is -- see store.py, where these are
@@ -213,7 +248,7 @@ const BREAK_RELOAD = 3;
 // null: wireControls() threw on the first missing checkbox, boot() never
 // reached reload(), and the result was a blank map whose buttons did nothing
 // -- with no clue that the page itself was half a version old.
-const PAGE_BUILD = 51;
+const PAGE_BUILD = 65;
 
 async function boot() {
   checkPageBuild();
@@ -231,7 +266,11 @@ async function boot() {
   map = L.map('map', {
     crs: L.CRS.Simple,
     minZoom: -6,
-    maxZoom: state.nativeZoom + 2,
+    // Four levels past the finest tiles rather than two. Past the pyramid
+    // the terrain is upscaled and soft, but what you are looking at that
+    // close is the path -- which is drawn from the route and stays sharp at
+    // any zoom -- so the limit is about the picture and not about the tiles.
+    maxZoom: state.nativeZoom + 4,
     zoomSnap: 0.25,
     preferCanvas: true,
     // No flick panning. Leaflet keeps moving the map after you let go, and
@@ -251,6 +290,13 @@ async function boot() {
     // at the new zoom immediately costs nothing and the path is right in every
     // frame it is drawn in.
     zoomAnimation: false,
+    // Nor a fade on the tiles. Leaflet brings each new tile in over 200 ms of
+    // opacity, which is worth it over a network and is nothing but flicker
+    // here: the tiles are local files, and one wheel notch moves 1.25 zoom
+    // levels, so every notch swaps the tile level and starts a fade the next
+    // notch interrupts -- with the coarse blurry layer showing through the
+    // half-transparent tiles in between.
+    fadeAnimation: false,
     attributionControl: false,
     zoomControl: false,     // the wheel and the trackpad already do this
   });
@@ -307,7 +353,7 @@ async function boot() {
       tileSize: 256,
       noWrap: true,
       bounds: imageBounds,
-      keepBuffer: v.keep_buffer ?? 4,
+      keepBuffer: v.keep_buffer ?? 8,
       updateWhenIdle: false,
       // The tiles are local files, so fetching them mid-animation costs
       // nothing and stops the terrain arriving a beat after the markers.
@@ -316,10 +362,12 @@ async function boot() {
     };
     baseTiles = L.tileLayer(v.tile_url, baseOpts).addTo(map);
     tiles = L.tileLayer(v.tile_url, tileOpts);
+    warmNeighbours();
     let loaded = 0;
     tiles.on('tileload', () => { loaded++; });
     tiles.on('load', () => { if (loaded === 0) showTileHint(); });
     tiles.addTo(map);
+    map.on('moveend zoomend', warmNeighbours);
   } else {
     showTileHint();
   }
@@ -327,6 +375,9 @@ async function boot() {
   // Panning is limited to whatever exists: the map, the route, or both.
   const limits = dataBounds ? L.latLngBounds(imageBounds).extend(dataBounds) : imageBounds;
   map.setMaxBounds(limits.pad(0.3));
+  // Kept, because a remembered centre is worth restoring exactly when it is
+  // somewhere you could have dragged to.
+  state.panLimits = limits.pad(0.3);
 
   // Order is draw order. The casing is a dark, wider copy of the line
   // underneath the coloured one: the map is a warm painting and an amber
@@ -383,7 +434,16 @@ async function boot() {
   // keeping it up to date.
   insideLiveGroup = L.layerGroup().addTo(map);
 
-  map.fitBounds(dataBounds || imageBounds, { padding: [20, 20] });
+  // Where you were looking last time, if it is still a place on this map.
+  // Coming back to the whole of the Lands Between when you were three zooms
+  // deep on one cave is a small chore, and it is repeated every session.
+  const back = savedView();
+  if (back) map.setView(back.centre, back.zoom, { animate: false });
+  else map.fitBounds(dataBounds || imageBounds, { padding: [20, 20] });
+  // Both, because a zoom with no drag in it fires zoomend and moveend and a
+  // drag fires only moveend; writing the same two numbers twice costs nothing
+  // and missing one of the two gestures is the whole feature.
+  map.on('moveend zoomend', saveView);
 
   buildSessions();
   buildStats();
@@ -397,13 +457,26 @@ async function boot() {
   // only needs refetching when that epsilon changes enough to matter. Nudging
   // the zoom a quarter step redrew the whole path for no visible difference,
   // and the redraw is what flickers.
+  //
+  // And the marks are not refetched at all. Where they sit and how they
+  // cluster are both in map pixels, so a zoom cannot change either -- but
+  // the reload asked /api/deaths, /api/warps and /api/interiors for them
+  // again anyway and rebuilt every one: 264 marker elements taken off the
+  // map and made afresh, for an answer identical to the one already drawn.
+  // One wheel notch is 1.25 zoom levels at these settings, so that ran on
+  // every notch of every scroll.
   map.on('zoomend', () => {
     const level = Math.round(map.getZoom());
     if (level === state.drawnZoom) return;
     state.drawnZoom = level;
-    scheduleReload(200);
+    scheduleReload(200, false);
   });
-  await reload();
+  // The route only. reload() would fetch the marks as well and then this
+  // would fetch them again -- three times over for the deaths, since
+  // drawWorldVisible() ends by reclustering them. Invisible while each call
+  // costs a tenth of a second; measured on a database ten times the size of
+  // routes.db, boot spent 55 seconds in requests, most of it asking twice.
+  await reload({ marks: false });
   // Deaths and teleports first: the interior drawings put those marks on
   // their paths, and a list that arrives afterwards leaves the first draw
   // without them until something else happens to redraw it.
@@ -421,14 +494,91 @@ function selectPlane(which) {
     document.getElementById('plane-' + k).classList.toggle('on', k === which);
   }
   swapTiles(which, document.getElementById('plane-note'));
+  // During playback the map belongs to the playback: the committed route is
+  // off the map entirely and what you can see is `play.group`. Reloading it
+  // would fill a group nobody is looking at and leave the other plane's path
+  // drawn over this one.
+  if (play.on) { playRedrawPlane(which); return; }
   // The live tail belongs to the plane it was drawn on, and half of it is
   // usually the walk to the lift.
   state.live = [];
-  if (state.liveLayer) { state.liveLayer.setLatLngs([]); }
+  state.liveT = [];
+  redrawLive();
   scheduleReload(0);
   loadInteriors();
   loadDeaths();
   loadWarps();
+}
+
+// The first time a zoom level is reached, its tiles are not in the browser
+// yet -- and with zoomAnimation off the map arrives at the new level at once,
+// so what you get is the coarse layer stretched over the whole screen and
+// then a snap to sharp. Measured on genuinely cold tiles, three trials each:
+// 6, 26 and 26 per cent of the screen with no tile for 45 to 61 ms; with the
+// level fetched beforehand, 0 per cent every time.
+//
+// So the level either side is fetched while nothing is happening. Held in a
+// small array because an Image the page has dropped can be collected and
+// decoded again, and bounded because the whole point is that this is the
+// cheap thing to do when the map is idle -- one screen's worth per level, two
+// levels, and never while a gesture is still running.
+let warmTimer = null;
+let warmHeld = [];
+
+// One screen of tiles around a point, at the level already on screen, asked
+// for straight away rather than on the idle timer: this is for the moment
+// before the map is sent somewhere, which is exactly when there is no idle.
+function warmAhead(xy) {
+  if (!tiles || !xy) return;
+  const z = tiles._tileZoom;
+  if (z === undefined) return;
+  const size = tiles.getTileSize().x;
+  const b = map.getPixelBounds(toLatLng(xy), z);
+  const min = b.min.divideBy(size).floor();
+  const max = b.max.divideBy(size).floor();
+  const want = [];
+  for (let x = min.x; x <= max.x; x++) {
+    for (let y = min.y; y <= max.y; y++) {
+      want.push(L.Util.template(tiles._url, { z, x, y, s: '' }));
+    }
+  }
+  warmHeld = want.slice(0, 60).map((src) => {
+    const im = new Image();
+    im.src = src;
+    return im;
+  });
+}
+
+function warmNeighbours() {
+  if (!tiles) return;
+  clearTimeout(warmTimer);
+  warmTimer = setTimeout(() => {
+    const z = tiles._tileZoom;
+    if (z === undefined) return;
+    const size = tiles.getTileSize().x;
+    const lo = tiles.options.minNativeZoom ?? 0;
+    const hi = tiles.options.maxNativeZoom ?? z;
+    const want = [];
+    for (const level of [z + 1, z - 1]) {
+      if (level < lo || level > hi) continue;
+      const b = map.getPixelBounds(map.getCenter(), level);
+      const min = b.min.divideBy(size).floor();
+      const max = b.max.divideBy(size).floor();
+      for (let x = min.x; x <= max.x; x++) {
+        for (let y = min.y; y <= max.y; y++) {
+          want.push(L.Util.template(tiles._url, { z: level, x, y, s: '' }));
+        }
+      }
+    }
+    // A screen is about twenty tiles a level, so this is a ceiling and not a
+    // budget: it exists so an odd window size can never turn an idle moment
+    // into a hundred requests.
+    warmHeld = want.slice(0, 80).map((src) => {
+      const im = new Image();
+      im.src = src;
+      return im;
+    });
+  }, 400);
 }
 
 function swapTiles(plane, note) {
@@ -439,12 +589,13 @@ function swapTiles(plane, note) {
       'No underground map has been built yet, so the surface terrain stays ' +
       'up behind the route. tools/build_map.py --map M01 makes one, tiled ' +
       'into viewer/tiles-underground.';
+    note.hidden = false;
     return;
   }
-  note.textContent = plane === 'underground'
-    ? 'Siofra, Ainsel and Deeproot, on their own terrain. The same projection '
-      + 'places a route on either: they are the same world, one under the other.'
-    : 'The Lands Between. Anything below it is on the other map.';
+  // Nothing to say about a map that is simply there. The note is for the
+  // case where the plane you asked for does not exist yet.
+  note.textContent = '';
+  note.hidden = true;
   if (!tiles || !has) return;
   const url = plane === 'underground'
     ? (v.underground_tile_url || '/tiles-underground/{z}/{x}/{y}.webp')
@@ -476,6 +627,38 @@ function pref(key) {
 function savePref(key, value) {
   try { localStorage.setItem(`route.${key}`, String(value)); }
   catch (e) { /* private mode: settings just do not persist */ }
+}
+
+// Where the map is pointed, remembered across restarts.
+//
+// A centre and a zoom rather than the bounds: a window that is not the size it
+// was last time should keep the middle and the scale it had, not re-fit itself
+// to a rectangle and land at some third zoom nobody chose. Three decimals is
+// finer than a pixel at any zoom this map has.
+function saveView() {
+  // Not while the playback is driving. It sweeps the map from one end of the
+  // route to the other, and where it happened to stop is not where you were
+  // looking -- the view from before you pressed play is.
+  if (play && play.on) return;
+  if (!map) return;
+  const c = map.getCenter();
+  savePref('view', `${c.lat.toFixed(3)},${c.lng.toFixed(3)},${map.getZoom()}`);
+}
+
+// And read back only if it still means something. A map image of a different
+// size, or a zoom ladder that has changed, would otherwise put you off the
+// edge of the world at a zoom the map will not hold -- so it is checked
+// against the same limits a drag is, and simply ignored when it fails, which
+// leaves the old behaviour of fitting the route.
+function savedView() {
+  const raw = pref('view');
+  if (!raw) return null;
+  const [lat, lng, zoom] = String(raw).split(',').map(Number);
+  if (![lat, lng, zoom].every(Number.isFinite)) return null;
+  if (zoom < map.getMinZoom() || zoom > map.getMaxZoom()) return null;
+  const centre = L.latLng(lat, lng);
+  if (state.panLimits && !state.panLimits.contains(centre)) return null;
+  return { centre, zoom };
 }
 
 // A checkbox that remembers, and says what to do when it changes.
@@ -542,6 +725,45 @@ function showStaleRecorder() {
   );
 }
 
+// The server going away is the failure this page hits most often -- you
+// stop the recorder and leave the map open -- and until now it said nothing
+// at all: a zoom threw `TypeError: Failed to fetch` into the void, the
+// status line still read Live, and a checkbox you had just unticked stayed
+// drawn, because the loader threw before it got to clearing anything. The
+// page then lies about what is on it.
+//
+// One place, because a fetch can fail at twenty call sites and they all mean
+// the same thing. The banner says which command brings it back.
+let lostShown = false;
+function lostRecorder() {
+  const status = document.getElementById('status');
+  if (status) {
+    status.textContent = 'Not answering';
+    status.dataset.live = '0';
+  }
+  if (lostShown) return;
+  lostShown = true;
+  showBanner(
+    'The recorder stopped answering, so nothing on this page can be '
+    + 'refreshed: what you are looking at is the last thing it sent. Start it '
+    + 'again -- Record route.bat, or python -m tracker.main serve -- and '
+    + 'reload this page.'
+  );
+}
+
+// Nothing is allowed to fail silently, including a call site added later that
+// forgets to ask. Every rejected fetch lands here whether or not it was
+// caught on the way, and the ones that are handled deliberately -- the
+// playback's "no recorder: play what is on screen" -- catch their own and
+// never reach it.
+window.addEventListener('unhandledrejection', (e) => {
+  const why = String(e && e.reason);
+  if (why.includes('Failed to fetch') || why.includes('NetworkError')) {
+    lostRecorder();
+    e.preventDefault();
+  }
+});
+
 let hintShown = false;
 function showTileHint() {
   if (hintShown) return;
@@ -560,12 +782,20 @@ function epsilonForZoom() {
   return Math.max(0.4, Math.pow(2, state.nativeZoom - map.getZoom()));
 }
 
-function scheduleReload(delay = 250) {
+// `marks` is false for a reload a zoom asked for: see the zoomend handler.
+function scheduleReload(delay = 250, marks = true) {
   clearTimeout(state.reloadTimer);
-  state.reloadTimer = setTimeout(reload, delay);
+  // Two reloads can be queued before either runs -- a filter change and then
+  // a zoom -- and the second must not drop the marks the first one asked for.
+  state.reloadMarks = state.reloadMarks || marks;
+  state.reloadTimer = setTimeout(() => {
+    const withMarks = state.reloadMarks;
+    state.reloadMarks = false;
+    reload({ marks: withMarks });
+  }, delay);
 }
 
-async function reload() {
+async function reload({ marks = true } = {}) {
   if (align.on) return;
   const layers = [state.plane];
 
@@ -587,7 +817,11 @@ async function reload() {
   // Fetch first, clear second. Clearing up front left the map empty for as
   // long as the request took, which reads as a flicker on every zoom.
   const data = await (await fetch('/api/route?' + p)).json();
-  markerGroup.clearLayers();
+  // The cave pins are not the route's to take off the map. They were cleared
+  // here and put back by the loadInteriors() at the bottom, which is fine
+  // while every reload runs both halves -- and leaves the map with no pins at
+  // all on a reload that is only about the path.
+  if (marks) markerGroup.clearLayers();
   routeGroup.clearLayers();
   casingGroup.clearLayers();
   drawSegments(data.segments);
@@ -597,9 +831,16 @@ async function reload() {
   // invisible; losing them until the next commit is not.
   redrawLive();
   setStats(`${data.points_out.toLocaleString()} of ${data.points_in.toLocaleString()} points drawn`);
+  if (!marks) return;
   await loadDeaths();
   await loadWarps();
-  if (state.layers.interior) loadInteriors();
+  // Not guarded on the layer being on. `loadInteriors()` asks that question
+  // first and answers it by taking everything off the map -- so guarding it
+  // here meant the one function that clears the legacy dungeons was never
+  // reached on the reload that turns them off. Measured: unticking Caves and
+  // dungeons took all 39 pins off and left every one of the seven castles
+  // drawn, which is not what the box says it does.
+  loadInteriors();
 }
 
 function heightExtent(segments) {
@@ -611,7 +852,12 @@ function heightExtent(segments) {
 function drawSegments(segments) {
   const [lo, hi] = heightExtent(segments);
   state.span = timeSpan(segments);
+  // Kept so the legend can be rewritten as the ramp slides without going back
+  // to the segments for a number that has not changed.
+  state.hExtent = [lo, hi];
   showRamp(lo, hi);
+  // Whatever was drawn last time went off the map with `routeGroup`.
+  state.tinted = [];
 
   for (const seg of segments) {
     const under = seg.layer === 'underground';
@@ -647,11 +893,17 @@ function drawSegments(segments) {
       const end = i === seg.xy.length;
       if (end || bandOf(seg, i, lo, hi) !== bandOf(seg, start, lo, hi)) {
         if (i - start > 1) {
-          L.polyline(seg.xy.slice(start, i + 1).map(toLatLng), {
+          const line = L.polyline(seg.xy.slice(start, i + 1).map(toLatLng), {
             renderer,
             color: bandColor(bandOf(seg, start, lo, hi)),
             weight, opacity, lineJoin: 'round',
           }).addTo(routeGroup);
+          // Which moment decided that colour. Under `by age` the answer
+          // changes while you play -- see recolourRoute() -- and the only
+          // thing needed to work out the new one is the moment itself.
+          if (state.tint === 'age') {
+            rememberTint(line, seg.t[start]);
+          }
         }
         start = i;
       }
@@ -711,6 +963,15 @@ async function loadInteriors() {
   if (!state.layers.interior) {
     markerGroup.clearLayers();
     placedGroup.clearLayers();
+    // Nothing is drawn in the open any more, and this is the path that says
+    // so: `drawWorldVisible()` is never reached from here, so the set it
+    // keeps would still be naming seven castles that have just come off the
+    // map. A jump's end that stood down in favour of one of them has to come
+    // back, or unticking Caves and dungeons takes marks with it that are not
+    // caves and not dungeons.
+    state.alwaysDrawn = new Set();
+    state.placedByMap.clear();
+    loadWarps();
     return;
   }
   const data = await (await fetch('/api/interiors')).json();
@@ -727,7 +988,6 @@ async function loadInteriors() {
     byAnchor.get(v.map_id).push(v);
   }
 
-  buildUnplaced(data.unplaced || []);
   buildOffMap(data.unplaced || []);
 
   for (const group of byAnchor.values()) {
@@ -791,6 +1051,42 @@ async function loadInteriors() {
     mark.on('mouseout', () => hideInside(false));
     mark.on('click', () => showInside(group, true));
     mark.addTo(markerGroup);
+
+    // A dungeon can have more than one mouth, and the pin stands at the one
+    // the route agrees on -- so a cave walked in at one end and out of the
+    // other was marked at one end only, with nothing on the map where you
+    // came out. Every other mouth gets a pin of its own now. Four dungeons in
+    // `routes.db` have two: Stormveil's doors 543 m apart, the Stranded
+    // Graveyard's 147, m30_11's 178, and the cave that was reported.
+    //
+    // Smaller, and without the badges. The visits and the deaths belong to
+    // the place and not to a door, so saying them twice a few hundred metres
+    // apart would be saying them twice. It is not draggable either: dragging
+    // sets where the dungeon *is*, which is one fact about the map, and the
+    // main pin is the one that carries it.
+    for (const mouth of otherMouths(group, door)) {
+      const alt = L.marker(toLatLng(mouth.xy), {
+        icon: L.divIcon({
+          className: 'cave-mark other-mouth',
+          html: `<span>${visible ? '\u265C' : '\u25B2'}</span>`,
+          iconSize: [MOUTH_PX, MOUTH_PX],
+          iconAnchor: [MOUTH_PX / 2, MOUTH_PX + 6],
+          popupAnchor: [0, -(MOUTH_PX + 6)],
+        }),
+        riseOnHover: true,
+        autoPan: false,
+      });
+      alt.bindPopup(
+        `<b>${group[0].label}</b><br>` +
+        `<span class="hint">another way in \u2014 ${mouth.n} `
+        + `visit${mouth.n === 1 ? '' : 's'} came through here.<br>`
+        + `The pin ${Math.round(metresApart(mouth.xy, group[0].xy))} m away `
+        + `is the same place.</span>`);
+      alt.on('mouseover', () => showInside(group, false));
+      alt.on('mouseout', () => hideInside(false));
+      alt.on('click', () => showInside(group, true));
+      alt.addTo(markerGroup);
+    }
   }
 
   // Everything above is drawn from the one answer already in hand, and only
@@ -814,6 +1110,16 @@ function onThisPlane(layer) {
     : state.plane === 'surface';
 }
 
+// Which of the two maps a mark belongs on. A dungeon's own layer is
+// "interior", which says what kind of place it is and not where its pin
+// stands: a cave off Siofra is drawn on the underground, and filing its
+// deaths by "interior" put them on the Lands Between. The server works the
+// plane out from the visit and sends it; `layer` is the fallback for a
+// recorder too old to, where interior has always meant surface.
+function markPlane(mark) {
+  return onThisPlane(mark.plane || mark.layer);
+}
+
 // Deaths recorded inside one dungeon, counted the way everything else on the
 // map is: only the ones the time window is showing, so the badge and the
 // marks it sits next to can never disagree.
@@ -835,6 +1141,13 @@ function inWindow(v) {
 async function drawWorldVisible(visits, seq) {
   placedGroup.clearLayers();
   state.placedByMap.clear();
+  // What is actually drawn in the open, which is a question other things ask:
+  // a jump's end standing at a castle's pin comes off the world map only
+  // because the castle itself is carrying it. Cleared here rather than set
+  // below, or unticking Caves and dungeons would leave the old set behind and
+  // those marks would vanish along with the drawing that was standing in for
+  // them -- which is the trap `hiddenInside()` is written around.
+  state.alwaysDrawn = new Set();
   if (!state.layers.interior) return;
   // Every path in here is fetched, so a second call can start while this one
   // is still drawing -- and then both add their layers to the same groups,
@@ -857,10 +1170,14 @@ async function drawWorldVisible(visits, seq) {
       layer = L.layerGroup().addTo(placedGroup);
       state.placedByMap.set(v.map_id, layer);
     }
-    drawInteriorInto(layer, v, d, renderer, {});
+    drawInteriorInto(layer, v, d, renderer, { permanent: true });
   }
-  // The entrance marks were clustered before this list was known.
+  // The entrance marks were clustered before this list was known -- and so
+  // were the ends of every jump that stands at one of these castles rather
+  // than where it happened inside it, which is a thing only `alwaysDrawn`
+  // can say and it was empty until the line above.
   loadDeaths();
+  loadWarps();
 }
 
 /* --- interiors drawn where they happened ---------------------------------
@@ -875,7 +1192,20 @@ async function drawWorldVisible(visits, seq) {
    ------------------------------------------------------------------------ */
 
 const inside = { key: null, pinned: false, cache: new Map(), timer: null,
-                 last: null };
+                 last: null,
+                 // The extent of what is drawn, in map pixels. Hovering a pin
+                 // puts a cave on screen and then the cursor has to be able
+                 // to get to it, which it could not: leaving the pin started
+                 // the fuse whatever the cursor did next, so moving towards
+                 // the thing that had just appeared was what took it away.
+                 box: null,
+                 live: false };
+
+// How far outside the drawn extent still counts as being in it, in screen
+// pixels. The box is in map pixels, so this is divided by the zoom scale --
+// otherwise at the overview zoom a cave is thirty pixels across and the
+// region around it is unhittable.
+const INSIDE_REACH_PX = 30;
 
 function insideKey(v) { return `${v.map_id}:${v.entered_ms}`; }
 
@@ -892,6 +1222,7 @@ async function fetchInterior(v) {
 
 async function showInside(group, pin, only) {
   clearTimeout(inside.timer);
+  inside.timer = null;
   const v = only || group[0];
   if (inside.pinned && !pin && inside.key !== insideKey(v)) return;
   inside.pinned = pin || inside.pinned;
@@ -918,22 +1249,51 @@ function hideInside(force) {
   if (inside.pinned && !force) return;
   clearTimeout(inside.timer);
   inside.timer = setTimeout(() => {
+    // Nulled as it fires, so `insideHover()` can tell a fuse that is already
+    // burning from one it has to light. Without that, a cursor moving away
+    // from the drawing restarted the timer on every mouse move and the fuse
+    // never reached the end.
+    inside.timer = null;
     insideGroup.clearLayers();
     insideLiveGroup.clearLayers();
     state.liveInsideLine = null;
     inside.key = null;
     inside.transform = null;
+    inside.box = null;
     inside.pinned = false;
     dimBackground(false);
     setCaption(null);
   }, force ? 0 : 140);
 }
 
+// The drawing is a region you can put the cursor in, not a thing you have to
+// keep pointing at a pin to see. Inside it the pending hide is put out;
+// outside it, one is lit.
+//
+// Hit-tested here rather than with a transparent rectangle on the map, for
+// the reason the path hover already is: the interior pane is
+// `pointer-events: none`, because a full-map canvas that takes the pointer
+// swallows every click on the map.
+function insideHover(latlng) {
+  if (!inside.box || inside.pinned || !inside.key) return;
+  const p = map.project(latlng, state.nativeZoom);
+  const near = INSIDE_REACH_PX / Math.pow(2, map.getZoom() - state.nativeZoom);
+  const b = inside.box;
+  const over = p.x >= b[0] - near && p.x <= b[2] + near
+            && p.y >= b[1] - near && p.y <= b[3] + near;
+  if (over) { clearTimeout(inside.timer); inside.timer = null; }
+  else if (!inside.timer) hideInside(false);
+}
+
 function dimBackground(on) {
   // The route and the marks go right down; the terrain only part way, because
   // where the dungeon sits in the world is half of what the drawing is for.
-  for (const name of ['overlayPane', 'markerPane', 'deaths', 'warps',
-                      'playmarks']) {
+  // Every pane a mark can be drawn into, and the list has to be kept beside
+  // the panes themselves: `respawns` was created after this was written and
+  // never added, so hovering a cave dimmed the world and left 35 respawn
+  // marks standing over it at full strength.
+  for (const name of ['overlayPane', 'markerPane', 'deaths', 'respawns',
+                      'warps', 'playmarks']) {
     const pane = map.getPane(name);
     if (pane) pane.style.opacity = on ? '0.18' : '';
   }
@@ -956,13 +1316,16 @@ function interiorTransform(v, d) {
   // So the frame belongs to the dungeon: one pair of (local origin, map
   // position) taken from the visit that actually walked in, and every visit
   // to that dungeon drawn in it.
-  // A position set by hand is the last word, so it comes before any frame
-  // worked out from the route -- otherwise dragging a dungeon moved its
-  // marker and left its path where the inference had put it.
-  if (v.placed !== 'by hand') {
-    const frame = state.dungeonFrame.get(v.map_id);
-    if (frame) return frameTransform(frame);
-  }
+  // A position set by hand is the last word, and the way it gets the last
+  // word is that `learnDungeonFrame()` builds that dungeon's frame out of it
+  // and lets nothing else touch the map -- so there is one frame here and
+  // every visit is drawn in it, hand-placed or not. Asking the tier instead
+  // and centring on `d.bounds` below meant a hand-placed dungeon had no
+  // frame at all: one drawing per run, each centred on its own extent, so
+  // they did not agree with each other and the one still being walked moved
+  // under the player. See the note in `learnDungeonFrame()` for the numbers.
+  const frame = state.dungeonFrame.get(v.map_id);
+  if (frame) return frameTransform(frame);
 
   if (v.placed === 'by hand' || v.placed === 'the way in') {
     // Placed at the dungeon it opens off, which is a neighbourhood rather
@@ -1028,7 +1391,7 @@ async function placeDungeon(v, mark) {
   }
   // Its drawing hangs off the marker, so both are rebuilt from the new place.
   state.dungeonFrame.delete(v.map_id);
-  await loadInteriors();
+  await afterPlacing();
   setStats(`${v.label} placed by hand. Drag it again to correct it.`);
 }
 
@@ -1076,13 +1439,76 @@ function metresApart(a, b) {
 // from, and the marker goes there too. It is a count and not a medoid because
 // the question is not "where is the middle of these" -- two real mouths have
 // no meaningful middle -- but "which of these doors is the one you use".
-function agreedDoor(visits, map_id) {
-  const anchors = visits.filter((v) => v.map_id === map_id && v.xy)
-                        .map((v) => v.xy);
-  let best = null, bestN = 0;
-  for (const a of anchors) {
-    const n = anchors.filter((b) => metresApart(a, b) < SAME_DOOR_M).length;
-    if (n > bestN) { bestN = n; best = a; }
+// How wide a second pin is. Smaller than the main one, which is 20 to 34 px
+// by how long you have spent in the place: this one is a door and not the
+// place, so it should read as the lesser of the two.
+const MOUTH_PX = 17;
+
+// The mouths of a dungeon that are not the one its pin stands at. Clustered
+// at the same tolerance the door vote uses, so several readings of one doorway
+// stay one doorway and only a genuinely different way in earns a pin.
+function otherMouths(group, door) {
+  const out = [];
+  const at = door || (group[0] && group[0].xy);
+  if (!at) return out;
+  // How big the place is, in its own metres. Two mouths of one dungeon cannot
+  // be further apart than the dungeon is -- which is the test that already
+  // tells a door from a gate in `warps()` and stops the entrance vote
+  // overwriting a real second mouth. This was the third question of that shape
+  // and the only one that was not asking it.
+  //
+  // Reported from the field: "I teleported from the overworld into a cave, and
+  // it created an exit icon for the cave in the overworld where I teleported
+  // from." The anchor behind that pin was 504 m from the real door of a
+  // catacomb 169 m across, so it was never a mouth whatever else it was. On
+  // routes.db the rule drops that one and m30_11's, whose two anchors are
+  // 178 m apart on the map for a place 147 m across while the points just
+  // inside them are 15 m apart -- which cannot be two doors either. The three
+  // real second mouths all pass: 147 m in a place 234 across, 543 in 654,
+  // 94 in 134.
+  //
+  // Nothing is dropped for want of an extent. A dungeon with no samples
+  // recorded inside says nothing about its own size, and the rule is the one
+  // the placement tiers use: drop an anchor against evidence, never for the
+  // lack of it.
+  const room = group.reduce((m, v) => Math.max(m, v.extent_m || 0), 0);
+  for (const v of group) {
+    if (!v.xy) continue;
+    const off = metresApart(v.xy, at);
+    if (off < SAME_DOOR_M) continue;
+    if (room && off > room) continue;
+    const near = out.find((m) => metresApart(m.xy, v.xy) < SAME_DOOR_M);
+    if (near) near.n += 1;
+    else out.push({ xy: v.xy, n: 1 });
+  }
+  return out;
+}
+
+// `doorOf` is how to read a visit's doorway. It defaults to where the visit
+// is drawn, which is the same thing everywhere except a dungeon placed by
+// hand -- there every visit carries the one position you gave, and the route's
+// own doorways are the thing being voted on.
+function agreedDoor(visits, map_id, doorOf) {
+  const at = doorOf || ((v) => v.xy);
+  const here = visits.filter((v) => v.map_id === map_id && at(v));
+  // Weighted by the time spent inside on each visit, not by the number of
+  // visits. Reported from the field: a cave walked through in one door and
+  // out the other, then re-entered twice at the far mouth for 25 and 34
+  // seconds to look at something -- which outvoted the 283-second traversal
+  // two to one and moved the pin, and the drawing with it, to a door that
+  // had barely been used. Time asks the better question: which mouth did you
+  // do this place through.
+  //
+  // It keeps every case counting got right. Measured over routes.db, of the
+  // five dungeons whose visits disagree about the door, count and time pick
+  // the same one in all five -- Sellia Crystal Tunnel is 4 visits and 1,914 s
+  // at one mouth against 1 visit and 30 s at the other, and agrees either way.
+  const weight = (v) => Math.max(1, (v.duration_ms || 0) / 1000);
+  let best = null, bestW = 0;
+  for (const a of here) {
+    const w = here.filter((b) => metresApart(at(a), at(b)) < SAME_DOOR_M)
+                  .reduce((sum, b) => sum + weight(b), 0);
+    if (w > bestW) { bestW = w; best = at(a); }
   }
   return best;
 }
@@ -1124,16 +1550,25 @@ async function learnDungeonFrame(visits) {
   // through from another dungeon does the same, and walking out ties it to
   // the last step before the door. In that order, because that is the order
   // of how directly each was measured.
-  // A dungeon someone has placed by hand takes no frame at all: its drawing
-  // is centred on the position they gave it.
   const byHand = new Set(visits.filter((v) => v.placed === 'by hand')
                                .map((v) => v.map_id));
+  // What the *route* says a visit's doorway is, which for a dungeon somebody
+  // has placed by hand is not what `xy` and `placed` say: those carry the
+  // hand position, the same one for every visit to that map. The frame is
+  // learned from the route either way and only its position on the map comes
+  // from the hand -- see the end of this function.
+  const doorOf = (v) => (v.door_xy ? v.door_xy : v.xy);
+  const tierOf = (v) => (v.door_xy ? v.door_placed : v.placed);
   // Every doorway anybody walked through, as a pair: where it is inside, and
   // where it is on the map.
   const doors = new Map();
+  // The same pairs, kept whole rather than deduped, because which one the
+  // dungeon hangs off is decided below by how many of them agree.
+  const cand = new Map();
   for (const want of ['entrance', 'the doorway', 'exit']) {
     for (const v of visits) {
-      if (byHand.has(v.map_id) || !v.xy || v.placed !== want) continue;
+      const door = doorOf(v);
+      if (!door || tierOf(v) !== want) continue;
       const d = await fetchInterior(v);
       if (!d.ok || !d.segments.length) continue;
       const seg = want === 'exit' ? d.segments[d.segments.length - 1]
@@ -1141,23 +1576,74 @@ async function learnDungeonFrame(visits) {
       const local = want === 'exit' ? seg.xy[seg.xy.length - 1] : seg.xy[0];
       if (!doors.has(v.map_id)) doors.set(v.map_id, []);
       const known = doors.get(v.map_id);
-      // Two readings of one doorway are one doorway.
-      if (!known.some((k) => Math.hypot(k.xy[0] - v.xy[0],
-                                        k.xy[1] - v.xy[1]) < 10)) {
-        known.push({ local, xy: v.xy });
+      // Two readings of one doorway are one doorway -- and at the same
+      // tolerance the door vote and the second-mouth pins use, in metres.
+      // This was a bare hypot over map pixels against 10, which agrees with
+      // 15 m only because this map happens to be about a pixel to the metre;
+      // tile a map at another scale and the three tests would disagree about
+      // what counts as one door.
+      if (!known.some((k) => metresApart(k.xy, door) < SAME_DOOR_M)) {
+        known.push({ local, xy: door });
       }
-      // The first door of the best tier, unless the route agrees on another
-      // one -- in which case that is the door this dungeon is known by, and
-      // the one it should be drawn from.
-      const agreed = agreedDoor(visits, v.map_id);
-      const held = state.dungeonFrame.get(v.map_id);
-      const better = !held
-        || (agreed && metresApart(v.xy, agreed) < SAME_DOOR_M
-            && metresApart(held.xy, agreed) >= SAME_DOOR_M);
-      if (better) state.dungeonFrame.set(v.map_id, { local, xy: v.xy });
+      // Kept as a candidate. Which of them the dungeon is hung off is
+      // settled after every tier has been walked, because the answer is a
+      // property of the set and not of the order they arrive in.
+      if (!cand.has(v.map_id)) cand.set(v.map_id, []);
+      const mine = cand.get(v.map_id);
+      // The best tier that offers anything, and only that one: the order of
+      // the loop is the order of how directly each was measured.
+      if (!mine.length || mine[0].tier === want) {
+        mine.push({ local, xy: door, tier: want,
+                    secs: Math.max(1, (v.duration_ms || 0) / 1000) });
+      }
     }
   }
   const pr = state.meta.projection;
+  // Which reading of the doorway the dungeon hangs off. Not the first of the
+  // best tier, which is the order the visits happen to come in, and not the
+  // longest visit either -- what settles it is how many of the readings agree
+  // with each other.
+  //
+  // They are compared by the frame each *implies*: where the dungeon's own
+  // origin lands, which is the door's map position minus its local one. Two
+  // readings of one doorway imply the same origin to within sampling noise,
+  // and so do two real mouths of a dungeon whose inside is laid out to match
+  // the ground above it -- which is what makes this the right thing to count.
+  // A reading that implies a different origin is a bad reading whatever it
+  // looks like from outside.
+  //
+  // Reported: a cave whose marker sat 13 m past its own mouth once the path
+  // had been dragged into line. Its doorway had been read five times: three
+  // in quarter-second capture agreeing to a metre, and one in a five-second
+  // import that landed 18.6 m short of the door on the surface and 10.2 m
+  // past it inside -- which is one doorway sampled coarsely, not two
+  // doorways. That reading won because the visit behind it lasted 405
+  // seconds against the others' 231, so the whole cave hung off the worst
+  // measurement of it.
+  //
+  // Measured over the 14 dungeons in `routes.db` with more than one reading:
+  // two change. m31_15's frame goes from being exact at the coarse reading
+  // and 28-29 m out at the two good ones to exact at both good ones; m18_00
+  // swaps between two readings 10 m apart, which is neither better nor
+  // worse. The other twelve are untouched, and no dungeon's worst door error
+  // rises.
+  const originOf = (c) => [c.xy[0] - c.local[0] * state.meta.projection.scale_x,
+                           c.xy[1] - c.local[1] * state.meta.projection.scale_y];
+  for (const [map_id, list] of cand) {
+    let best = null, bestN = 0, bestT = 0;
+    for (const c of list) {
+      const agree = list.filter(
+        (o) => metresApart(originOf(c), originOf(o)) < SAME_DOOR_M);
+      const secs = agree.reduce((sum, o) => sum + o.secs, 0);
+      // Time only breaks a tie. It is the right question for *which mouth*
+      // you use a place through and the wrong one for which reading of a
+      // mouth to trust, which is what this is.
+      if (agree.length > bestN || (agree.length === bestN && secs > bestT)) {
+        bestN = agree.length; bestT = secs; best = c;
+      }
+    }
+    if (best) state.dungeonFrame.set(map_id, { local: best.local, xy: best.xy });
+  }
   for (const [map_id, known] of doors) {
     const frame = state.dungeonFrame.get(map_id);
     if (!frame || known.length < 2) continue;
@@ -1165,6 +1651,54 @@ async function learnDungeonFrame(visits) {
       const turn = frameTurn(frame, other, pr);
       if (turn) { frame.turn = turn; break; }
     }
+  }
+  // A dungeon somebody placed by hand gets a frame like every other one,
+  // built from the position they gave it rather than from a doorway the
+  // route thinks it knows. Last, so it overwrites anything the loop above
+  // learned: drag a dungeon that already had a door frame and the drag has
+  // to win, which is the whole of what the tier is for.
+  //
+  // Centred on the position, and the word carrying the weight is *the
+  // dungeon's* extent. Centring each drawing on its own extent -- which is
+  // what this did, from `d.bounds` inside `interiorTransform()` -- draws
+  // every run through the place somewhere different, and makes the run you
+  // are walking crawl, because its bounds grow with every step you take.
+  // Measured on the Chapel of Anticipation: three runs put the same point
+  // inside it 25, 108 and 126 m apart on the map, and the run in progress
+  // slid 100 m across Liurnia over the five minutes it lasted, in jumps of
+  // up to 66 m. Which is what "it doesn't match up with where I am on the
+  // map" was.
+  //
+  // The extent therefore comes from the runs that have *finished*. How big a
+  // place is is a fact about the place, and a run you are in the middle of
+  // has not finished saying; the first time you ever go somewhere that run
+  // is all there is, and then it is what gets used.
+  for (const map_id of byHand) {
+    const mine = visits.filter((v) => v.map_id === map_id && v.xy);
+    const frame = state.dungeonFrame.get(map_id);
+    if (frame && mine.length) {
+      // The route knows a doorway here, and the pin has been standing at it.
+      // Dragging the pin therefore says where that doorway is and nothing
+      // else: the point inside it ties to, and the turn measured from a
+      // second door, are the route's and are not the drag's to change. So the
+      // drawing moves exactly as far as the marker did.
+      frame.xy = mine[0].xy;
+      continue;
+    }
+    const done = mine.filter((v) => v.left_ms);
+    let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+    for (const v of (done.length ? done : mine)) {
+      const d = await fetchInterior(v);
+      if (!d.ok || !d.bounds) continue;
+      x0 = Math.min(x0, d.bounds.x0); x1 = Math.max(x1, d.bounds.x1);
+      z0 = Math.min(z0, d.bounds.z0); z1 = Math.max(z1, d.bounds.z1);
+    }
+    // Nothing recorded anywhere in there. Better no frame than a stale one
+    // from before the drag, which would move the pin and leave the path.
+    if (x0 === Infinity) { state.dungeonFrame.delete(map_id); continue; }
+    state.dungeonFrame.set(map_id, {
+      local: [(x0 + x1) / 2, (z0 + z1) / 2], xy: mine[0].xy,
+    });
   }
 }
 
@@ -1183,7 +1717,15 @@ function drawInteriorInto(group, v, d, lineRenderer, opts) {
   const at = interiorTransform(v, d);
   const b = d.bounds;
   const lo = b.y0, hi = b.y1 > b.y0 ? b.y1 : b.y0 + 1;
-  const markPane = group === placedGroup ? 'deaths' : 'insideMarks';
+  // A legacy dungeon's own deaths, respawns and teleports are drawn on the
+  // map for good, so they dim with the world like every other mark; the ones
+  // belonging to the dungeon being hovered are the thing being revealed and
+  // must not. That was decided by comparing the group against `placedGroup`
+  // -- and then each dungeon was given a group of its own *inside* it, so the
+  // comparison quietly became false for every one of them and 51 marks sat
+  // over four dimmed castles. Asked outright now, because the caller is the
+  // only one that knows which kind of drawing it wants.
+  const markPane = opts && opts.permanent ? 'deaths' : 'insideMarks';
 
   for (const seg of d.segments) {
     if (seg.xy.length < 2) continue;
@@ -1214,12 +1756,19 @@ function drawInteriorInto(group, v, d, lineRenderer, opts) {
       const end = i === pts.length;
       if (end || bandOf(seg, i, lo, hi) !== bandOf(seg, start, lo, hi)) {
         if (i - start > 1) {
-          L.polyline(pts.slice(start, i + 1), {
+          const band = L.polyline(pts.slice(start, i + 1), {
             renderer: lineRenderer,
             color: bandColor(bandOf(seg, start, lo, hi)),
             weight: state.weight, opacity: faint ? 1 : 0.95,
             lineJoin: 'round', dashArray: dash,
           }).addTo(group);
+          // A castle drawn in the open is part of the route and ages with it.
+          // Only the permanent drawings: the hover overlay is put up and taken
+          // down constantly, and registering that would be churn for a picture
+          // that is redrawn whenever it matters anyway.
+          if (state.tint === 'age' && opts && opts.permanent) {
+            rememberTint(band, seg.t[start]);
+          }
         }
         start = i;
       }
@@ -1229,16 +1778,44 @@ function drawInteriorInto(group, v, d, lineRenderer, opts) {
   // Lifts and teleporters inside the place. They have no world position --
   // nothing in a dungeon does -- so this drawing is the only frame they can
   // be shown in, and without it a jump inside a castle was invisible.
-  for (const jump of warpsInside(v)) {
-    const from = at(jump.from_local[0], jump.from_local[1]);
-    const to = at(jump.local[0], jump.local[1]);
-    L.polyline([toLatLng(from), toLatLng(to)], {
-      renderer: lineRenderer, color: '#8fb7cc', weight: 2, opacity: 0.65,
-      dashArray: '5,7',
-    }).addTo(group);
-    const ends = [['from', from, '\u2727'], ['to', to, '\u2726']];
-    for (const [which, pt, glyph] of ends) {
-      L.marker(toLatLng(pt), {
+  //
+  // Gated on the toggle like the deaths and respawns below: these are drawn
+  // into the dungeon's own pane rather than into warpGroup, so unticking
+  // Teleports emptied that group and left eight of them on the castles.
+  for (const { w: jump, ends: here } of (state.warps ? warpsInside(v) : [])) {
+    const spots = here.map((which) => {
+      const local = which === 'to' ? jump.local : jump.from_local;
+      return [which, at(local[0], local[1]),
+              which === 'to' ? '\u2726' : '\u2727'];
+    });
+    // Where it goes, in whatever frame each end is drawn in: this dungeon's
+    // for an end inside it, and the world's for one out on the surface, which
+    // is the same pixels once both are projected. Said before that there was
+    // "nothing here to join it to" for a gate, which was wrong -- the surface
+    // end is a real recorded position, not a made-up one -- so those marks
+    // pointed nowhere at all.
+    const endAt = (which) => {
+      if (here.includes(which)) {
+        const local = which === 'to' ? jump.local : jump.from_local;
+        return at(local[0], local[1]);
+      }
+      return which === 'to' ? jump.xy : jump.from_xy;
+    };
+    const pair = [endAt('from'), endAt('to')];
+    // A legacy dungeon is drawn on the map at all times, so a line standing
+    // between two of its rooms for ever is one more thing on a busy map that
+    // nobody asked for: those answer on hover, like the world's do. A cave's
+    // drawing only exists while you are looking at it, and looking at it *is*
+    // the asking -- so in there the line is part of the drawing.
+    const always = !(opts && opts.permanent);
+    if (always && pair[0] && pair[1]) {
+      L.polyline([toLatLng(pair[0]), toLatLng(pair[1])], {
+        renderer: lineRenderer,
+        color: '#8fb7cc', weight: 2, opacity: 0.75, dashArray: '5,7',
+      }).addTo(group);
+    }
+    for (const [which, pt, glyph] of spots) {
+      const mark = L.marker(toLatLng(pt), {
         pane: markPane,
         icon: L.divIcon({
           className: which === 'to' ? 'warp-mark' : 'warp-mark warp-from',
@@ -1255,8 +1832,17 @@ function drawInteriorInto(group, v, d, lineRenderer, opts) {
           `Inside ${v.label} (${v.map})<br>${jump.distance_m} m<br>` +
           `${new Date(jump.ts).toLocaleString()}`,
           'This was a death',
-          () => { map.closePopup(); callDeath({ ts: jump.ts }); }))
+          () => { map.closePopup(); callDeath({ ts: jump.ts, from_ts: jump.from_ts }); }))
         .addTo(group);
+      // The same answer the world's teleport marks give, which these did not.
+      // Drawn on the hover rather than left standing: a legacy dungeon is on
+      // the map at all times, so a permanent line meant its jumps were always
+      // announcing where they went while a cave's said nothing until you
+      // asked. Reported as both halves of that at once.
+      if (!always) {
+        mark.on('mouseover', () => showWarpLines([pair], group, lineRenderer));
+        mark.on('mouseout', hideWarpLines);
+      }
     }
   }
 
@@ -1315,6 +1901,24 @@ function drawInteriorInto(group, v, d, lineRenderer, opts) {
   return at;
 }
 
+// The extent of what has just been drawn, with a little air around it, in
+// map pixels. Padded in map units rather than in screen pixels so the frame
+// drawn from it does not have to be redrawn on every zoom -- the hit test
+// adds its own screen-pixel slack on top, which is what makes a small cave
+// reachable at a coarse zoom.
+function insideBox(corners) {
+  if (!corners.length) return null;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const q of corners) {
+    if (!q) continue;
+    x0 = Math.min(x0, q[0]); x1 = Math.max(x1, q[0]);
+    y0 = Math.min(y0, q[1]); y1 = Math.max(y1, q[1]);
+  }
+  if (!Number.isFinite(x0)) return null;
+  const air = Math.max(22, (x1 - x0 + y1 - y0) * 0.04);
+  return [x0 - air, y0 - air, x1 + air, y1 + air];
+}
+
 function drawInside(drawn, group, single) {
   insideGroup.clearLayers();
   // Whatever the frame is now, the tail belongs in it.
@@ -1332,13 +1936,37 @@ function drawInside(drawn, group, single) {
 
   // Kept so the live position can be placed on this same drawing: inside a
   // dungeon these local metres are the only position there is.
-  inside.transform = {
-    map_id: v.map_id,
-    at: drawInteriorInto(insideGroup, v, d, insideRenderer, { faint: true }),
+  const corners = [];
+  const keep = (at, bounds, anchor) => {
+    if (bounds) {
+      for (const x of [bounds.x0, bounds.x1]) {
+        for (const z of [bounds.z0, bounds.z1]) corners.push(at(x, z));
+      }
+    }
+    // The pin too. It stands at the doorway, which a hand placement can put
+    // outside the path's own extent -- and a region that does not contain the
+    // thing you hovered to open it would close the moment you set off.
+    if (anchor) corners.push(anchor);
   };
+  const at0 = drawInteriorInto(insideGroup, v, d, insideRenderer,
+                               { faint: true });
+  inside.transform = { map_id: v.map_id, at: at0 };
+  keep(at0, d.bounds, v.xy);
   for (const other of drawn.slice(1)) {
-    drawInteriorInto(insideGroup, other.v, other.d, insideRenderer,
-                     { faint: true });
+    const at = drawInteriorInto(insideGroup, other.v, other.d, insideRenderer,
+                                { faint: true });
+    keep(at, other.d.bounds, other.v.xy);
+  }
+  inside.box = insideBox(corners);
+
+  if (inside.box && !inside.pinned) {
+    const [x0, y0, x1, y1] = inside.box;
+    L.rectangle([toLatLng([x0, y0]), toLatLng([x1, y1])], {
+      renderer: insideRenderer,
+      color: 'rgba(224, 163, 60, 0.45)', weight: 1, dashArray: '4,5',
+      fill: true, fillColor: '#e0a33c', fillOpacity: 0.03,
+      interactive: false,
+    }).addTo(insideGroup);
   }
 
   const b = d.bounds;
@@ -1355,16 +1983,26 @@ function drawInside(drawn, group, single) {
           (blank ? ` (${blank} recorded no movement)` : '')
         : '');
   const how = {
-    'by hand': `Drawn to the map's scale where you put it; the dungeon's own ` +
-               `axes set the orientation.`,
+    'by hand': `Drawn to the map's scale where you put it; which way it ` +
+               `faces is the dungeon's own, and only a second way in can ` +
+               `measure that.`,
     'the way in': `Drawn to the map's scale, near the dungeon it opens off -- ` +
                   `nothing recorded says where this one is, so drag its ` +
                   `marker to put it right.`,
   };
-  const where = how[v.placed] && !state.dungeonFrame.has(v.map_id)
+  // A frame pins one point inside to one point on the map. Which way the
+  // inside is *turned* takes a second door, and until there is one the shape
+  // is right and its bearing is a guess: correct at the door it is pinned to
+  // and further out the further in you go. Raya Lucaria was 77 degrees and
+  // 133 m out at its second door for two days, drawn as confidently as
+  // anything else. So the caption says which of the two this is.
+  const held = state.dungeonFrame.get(v.map_id);
+  const where = how[v.placed] && !held
     ? how[v.placed]
-    : `Drawn to the map's scale at the entrance; the dungeon's own axes set ` +
-      `the orientation.`;
+    : (held && held.turn
+        ? `Drawn to the map's scale, turned to line up with the two ways in.`
+        : `Drawn to the map's scale, pinned at the way in -- which way it ` +
+          `faces is not known until you come in by a second door.`);
   setCaption(
     `${v.label} ${v.map} - ${w} by ${h} m${visits}. ${where}` +
     (inside.pinned ? ' Click the map to let go.' : '')
@@ -1382,11 +2020,31 @@ function nearestInTime(d, ts) {
   return best;
 }
 
+// Which *ends* of which jumps happened in here, in this place's own metres.
+// A lift or a teleporter inside one dungeon has both ends here and is drawn
+// with a line between them. A gate has one: step through a portal into a cave
+// and the arrival is a real position inside it, while the departure is out on
+// the surface with no frame to draw it in. Asking only for `w.inside` left
+// every one of those off the dungeon entirely and standing at its mouth on
+// the world map instead -- reported as exactly that, "the teleport marker was
+// placed at the entrance, instead of the position inside".
+//
+// The moment to test against the visit is the end's own: a jump *out* of here
+// carries the arrival's timestamp, which is after you left, so testing `w.ts`
+// would have thrown away all ten of the departures on routes.db.
 function warpsInside(v) {
   const end = v.left_ms || Infinity;
-  return (state.warpList || []).filter(
-    (w) => w.inside && w.map_id === v.map_id
-      && w.ts >= v.entered_ms && w.ts <= end);
+  const within = (ts) => ts >= v.entered_ms && ts <= end;
+  const out = [];
+  for (const w of (state.warpList || [])) {
+    const ends = [];
+    if (w.local && w.map_id === v.map_id && within(w.ts)) ends.push('to');
+    if (w.from_local && w.from_map_id === v.map_id && within(w.from_ts)) {
+      ends.push('from');
+    }
+    if (ends.length) out.push({ w, ends });
+  }
+  return out;
 }
 
 function deathsInside(v) {
@@ -1547,15 +2205,16 @@ async function openInterior(v, corner) {
   control('inset-title').textContent = v.label;
   control('inset-sub').textContent =
     `${insideFor(v)} \u00b7 ${new Date(v.entered_ms).toLocaleString()}`;
-  control('inset-figures').replaceChildren();
   control('inset-stats').textContent = 'Loading';
+  // Before the fetch, not after: this is about the place, and it should be
+  // there while the path is still coming.
+  insetOffMap(v);
 
   const p = new URLSearchParams({ map_id: v.map_id, t0: v.entered_ms });
   if (v.left_ms) p.set('t1', v.left_ms);
   const res = await fetch('/api/interior?' + p);
   const d = await res.json();
   if (!res.ok || !d.ok) {
-    insetFigures([]);
     control('inset-stats').textContent =
       d.error || 'The recorder could not return that path.';
     return;
@@ -1566,6 +2225,7 @@ async function openInterior(v, corner) {
 
 function closeInterior() {
   control('inset').hidden = true;
+  control('inset-offmap').hidden = true;
   control('inset').classList.remove('from-corner');
   state.inset = null;
   state.insetKey = null;
@@ -1602,7 +2262,6 @@ function drawInterior(d) {
   g.clearRect(0, 0, size, size);
 
   if (!d.bounds || !d.points_out) {
-    insetFigures([]);
     stats.textContent =
       'No path stored for this visit: either it was recorded before interior ' +
       'paths were kept, or you never moved min_move_m while inside.';
@@ -1688,32 +2347,12 @@ function drawInterior(d) {
   g.font = '11px system-ui, sans-serif';
   g.fillText(`${barM} m`, 12 + barPx + 6, size - 10);
 
+  // No figures. Points drawn, metres across, metres of height and the map ID
+  // were four labelled numbers under a picture that answers three of them
+  // better than any of them did -- the scale bar says how big it is and the
+  // shape says the rest. What is worth reading is in the subtitle, which is
+  // how long you were in there and when.
   stats.textContent = '';
-  insetFigures([
-    ['Path', `${d.points_out.toLocaleString()} of `
-             + `${d.points_in.toLocaleString()} points`],
-    ['Across', `${Math.round(w)} \u00d7 ${Math.round(h)} m`],
-    ['Height', `${Math.round(b.y1 - b.y0)} m`],
-    // /api/interior answers about a path, not about a place, so the map ID
-    // comes from the visit that asked for it.
-    ['Map', state.insetMap || ''],
-  ]);
-}
-
-// Figures as figures. One line of prose asked you to parse "240 of 438 points
-// - 92 by 66 m - 14 m of height"; four labelled numbers do not.
-function insetFigures(rows) {
-  const box = control('inset-figures');
-  if (!box.replaceChildren) return;
-  box.replaceChildren(...rows.filter((r) => r[1]).map(([term, value]) => {
-    const cell = document.createElement('div');
-    const dt = document.createElement('dt');
-    dt.textContent = term;
-    const dd = document.createElement('dd');
-    dd.textContent = value;
-    cell.append(dt, dd);
-    return cell;
-  }));
 }
 
 // Each of these can be asked for again while the last one is still in the
@@ -1765,7 +2404,7 @@ async function loadDeaths() {
   // like one. Cluster anything within a few metres and count it instead.
   const clusters = [];
   for (const d of data.deaths.filter(
-    (d) => d.xy && onThisPlane(d.layer)
+    (d) => d.xy && markPlane(d)
       && (!state.range || (d.ts >= state.range[0] && d.ts <= state.range[1]))
   )) {
     if (hiddenInside(d)) continue;
@@ -1784,7 +2423,7 @@ function drawRespawns() {
   // read as one.
   const clusters = [];
   for (const r of state.respawnList) {
-    if (!r.xy || !onThisPlane(r.layer)) continue;
+    if (!r.xy || !markPlane(r)) continue;
     if (state.range && (r.ts < state.range[0] || r.ts > state.range[1])) continue;
     if (hiddenInside(r)) continue;
     const near = clusters.find(
@@ -1894,21 +2533,48 @@ function metresBetween(a, b) {
 
 async function loadWarps() {
   const seq = ++refreshes.warps;
-  warpGroup.clearLayers();
-  if (!state.warps) return;
+  // Fetch first, clear second. Clearing up front took every teleport mark off
+  // the map for the length of the request -- which is the same flicker the
+  // route had before it was fixed the same way, and it ran on every zoom.
+  //
+  // And fetched whether or not the layer is on, because state.warpList is not
+  // only this layer's: the dungeon drawings put jumps on their own paths from
+  // it. Returning early left that list holding whatever it held before the
+  // session filter or the time window changed.
   const data = await (await fetch('/api/warps')).json();
   if (seq !== refreshes.warps) return;
   warpGroup.clearLayers();
   // Kept whole: the ones inside a dungeon have no world position and are
   // drawn on that dungeon's own drawing instead.
+  // Not filtered by plane. `state.warpList` is not the teleport layer's --
+  // the dungeon drawings read it, and so does the playback, which walks both
+  // planes and switches the map as it goes. Filtering here meant every jump
+  // made underground was missing from the playback entirely: two of them on
+  // `routes.db`, at 13:54 and 14:07 on 6 September, reported as teleports
+  // with no markers. The plane belongs to the drawing, which is where the
+  // deaths have always applied it.
   state.warpList = data.warps.filter(
-    (w) => onThisPlane(w.layer)
-      && (!state.range || (w.ts >= state.range[0] && w.ts <= state.range[1])));
-  const outside = state.warpList.filter((w) => !w.inside);
+    (w) => !state.range || (w.ts >= state.range[0] && w.ts <= state.range[1]));
+  if (!state.warps) return;
+  // An end inside a dungeon is drawn on the world map at that dungeon's pin,
+  // for want of anywhere better -- which is the right answer while the place
+  // itself is not on the screen, and the wrong one when it is. A legacy
+  // dungeon is drawn in the open at all times and now carries that end where
+  // it actually happened, so the stand-in comes off: 13 of the 20 jumps with
+  // an end inside a dungeon are into or out of one of those, and they would
+  // otherwise wear two marks for one event a few hundred metres apart. A
+  // cave needs no rule -- its drawing only appears while you hover it, and
+  // hovering dims the world's marks anyway.
+  const shown = (w, end) => {
+    const inside = end === 'to' ? w.local : w.from_local;
+    const map_id = end === 'to' ? w.map_id : w.from_map_id;
+    return !(inside && state.alwaysDrawn && state.alwaysDrawn.has(map_id));
+  };
+  const outside = state.warpList.filter((w) => !w.inside && markPlane(w));
   // Both ends: where you went is only half of a teleport, and a mark only at
   // the arrival leaves the other end of the jump unaccounted for.
-  addWarpMarks(outside, 'to');
-  addWarpMarks(outside, 'from');
+  addWarpMarks(outside.filter((w) => shown(w, 'to')), 'to');
+  addWarpMarks(outside.filter((w) => shown(w, 'from')), 'from');
 }
 
 function addWarpMarks(warps, end) {
@@ -1944,11 +2610,12 @@ function addWarpMarks(warps, end) {
     // know which of them killed you.
     mark.bindPopup(c.list.length === 1
       ? popupWithAction(warpPopup(c.list, end), 'This was a death',
-                        () => { map.closePopup(); callDeath({ ts: c.list[0].ts }); })
+                        () => { map.closePopup(); callDeath({ ts: c.list[0].ts, from_ts: c.list[0].from_ts }); })
       : warpPopup(c.list, end));
     // Hovering either end draws the jump itself, so the pair reads as one
     // event rather than two unrelated marks.
-    mark.on('mouseover', () => showWarpLines(c.list));
+    mark.on('mouseover', () => showWarpLines(
+      c.list.map((w) => [w.from_xy, w.xy])));
     mark.on('mouseout', hideWarpLines);
     mark.addTo(warpGroup);
   }
@@ -2024,20 +2691,32 @@ function popupWithAction(html, label, onClick) {
   return el;
 }
 
-function showWarpLines(list) {
+// Where a jump goes, shown while you point at it and not otherwise.
+//
+// The pairs arrive already resolved to map pixels, because an end inside a
+// dungeon is only in this space once that dungeon's frame has been applied,
+// and the caller is the one holding the frame. That is also what lets a jump
+// with one end on the surface draw a line at all: the two ends are in
+// different coordinate spaces right up until they are both projected, and
+// then they are the same pixels.
+function showWarpLines(pairs, into, lineRenderer) {
   hideWarpLines();
-  warpLines = list.map((w) => L.polyline(
-    [toLatLng(w.from_xy), toLatLng(w.xy)],
-    { renderer, color: '#8fb7cc', weight: 2, opacity: 0.75, dashArray: '5,7' }
-  ).addTo(warpGroup));
+  warpHome = into || warpGroup;
+  warpLines = pairs
+    .filter(([a, b]) => a && b)
+    .map(([a, b]) => L.polyline([toLatLng(a), toLatLng(b)], {
+      renderer: lineRenderer || renderer,
+      color: '#8fb7cc', weight: 2, opacity: 0.75, dashArray: '5,7',
+    }).addTo(warpHome));
 }
 
 function hideWarpLines() {
-  for (const l of warpLines) warpGroup.removeLayer(l);
+  for (const l of warpLines) warpHome.removeLayer(l);
   warpLines = [];
 }
 
 let warpLines = [];
+let warpHome = null;
 
 // The same list, pinned to the corner of the screen. A dungeon with no place
 // on the map has no marker to click, and the panel row for it is three
@@ -2055,6 +2734,12 @@ function buildOffMap(list) {
     if (!held || (v.duration_ms || 0) > (held.duration_ms || 0)) {
       best.set(v.map_id, v);
     }
+  }
+  // Every visit, keyed by map: the window this button opens lists them.
+  state.offmap = new Map();
+  for (const v of list) {
+    if (!state.offmap.has(v.map_id)) state.offmap.set(v.map_id, []);
+    state.offmap.get(v.map_id).push(v);
   }
   const places = [...best.values()];
   box.hidden = !places.length;
@@ -2081,36 +2766,75 @@ function buildOffMap(list) {
   }));
 }
 
-function buildUnplaced(list) {
-  // These have a stored path but no world position, so there is no marker to
-  // click. Without this they would be invisible: recorded, kept, unreachable.
-  const box = document.getElementById('unplaced');
-  const section = document.getElementById('unplaced-box');
-  section.hidden = !list.length;
-  box.textContent = '';
-  for (const v of list) {
+// Every visit to a place that is nowhere, drawn into the window the corner
+// button opens. This was a section in the panel, which meant the four trips
+// to the Roundtable Hold were four rows three sections down from a button
+// that already stood for the place -- the same list in two places, one of
+// them nowhere near the thing it was about. Attached to the button now: one
+// door in the corner, and everything about that place behind it.
+function insetOffMap(v) {
+  const box = control('inset-offmap');
+  if (!box.replaceChildren) return;
+  const group = (state.offmap.get(v.map_id) || [])
+    .slice().sort((a, b) => a.entered_ms - b.entered_ms);
+  box.hidden = !group.length;
+  if (!group.length) return;
+
+  // Folded, and closed to begin with. The window is opened to look at the
+  // shape of a place; a list of the times you have been there is a second
+  // question, and standing open it was the taller half of the window.
+  const fold = document.createElement('details');
+  fold.className = 'fold';
+  const head = document.createElement('summary');
+  head.textContent = group.length === 1
+    ? '1 visit' : `${group.length} visits`;
+  fold.append(head);
+  const rows = [];
+  for (const other of group) {
     const row = document.createElement('div');
-    row.className = 'session-row';
-    const text = document.createElement('span');
-    text.className = 'session-when';
-    text.textContent = `${v.label} - ${insideFor(v)}`;
-    text.title = `${v.map} - ${new Date(v.entered_ms).toLocaleString()}`;
-    const btn = document.createElement('button');
-    btn.className = 'ghost';
-    btn.textContent = 'Show path';
-    btn.addEventListener('click', () => openInterior(v));
-    // Nothing in the route says where these are, and nothing ever will: you
-    // only reach them by warping. But you know -- the game's own map puts the
-    // Roundtable Hold in the bottom-left corner -- and a position set by hand
-    // already outranks every inference. It just had no way in for a dungeon
-    // with no marker to drag.
-    const put = document.createElement('button');
-    put.className = 'ghost';
-    put.textContent = 'Put on map';
-    put.addEventListener('click', () => startPlacing(v));
-    row.append(text, btn, put);
-    box.appendChild(row);
+    row.className = 'visit';
+    const when = document.createElement('span');
+    when.textContent =
+      `${new Date(other.entered_ms).toLocaleString()} - ${insideFor(other)}`;
+    row.append(when);
+    // The one on screen says so rather than offering to draw itself again.
+    if (insideKey(other) === state.insetKey) {
+      const here = document.createElement('i');
+      here.className = 'off-here';
+      here.textContent = 'shown';
+      row.append(here);
+    } else {
+      const btn = document.createElement('button');
+      btn.className = 'ghost';
+      btn.textContent = 'Show path';
+      btn.addEventListener('click', () => openInterior(other, true));
+      row.append(btn);
+    }
+    rows.push(row);
   }
+
+  fold.append(...rows);
+  const out = [fold];
+
+  // Nothing in the route says where these are, and for most of them nothing
+  // ever will: you only reach them by warping. But you may well know -- and a
+  // position set by hand outranks every inference. It had no way in for a
+  // dungeon with no marker to drag, which is why it lives here.
+  //
+  // Not for a place the game itself puts nowhere. The Roundtable Hold has no
+  // way in on foot at all and the game's own map screen draws it off the
+  // terrain in a corner, so it is in the corner of the screen for good: an
+  // offer to correct that would be an offer to make it wrong. `nowhere_maps`
+  // in config says which, because which places those are is a fact about the
+  // game rather than about this database.
+  if (!v.fixed) {
+    const put = document.createElement('button');
+    put.className = 'ghost put-on-map';
+    put.textContent = 'Put on map';
+    put.addEventListener('click', () => { closeInterior(); startPlacing(v); });
+    out.push(put);
+  }
+  box.replaceChildren(...out);
 }
 
 async function unplaceDungeon(map_id, label) {
@@ -2135,7 +2859,7 @@ async function unplaceDungeon(map_id, label) {
   }
   setStats(`${label} taken off the map. It is in the corner now; `
            + `Put on map in the panel brings it back.`);
-  await loadInteriors();
+  await afterPlacing();
 }
 
 // Placing by click rather than by drag: there is no marker yet, so there is
@@ -2180,25 +2904,164 @@ async function placeAt(latlng) {
     return;
   }
   setStats(`${label} placed. Drag its marker to move it.`);
-  await loadInteriors();
-  await loadDeaths();
+  await afterPlacing();
 }
 
-function newLiveLine() {
-  state.liveLayer = L.polyline(state.live, {
-    renderer, color: '#f7d488', weight: 3.5, opacity: 1, lineJoin: 'round',
-  }).addTo(liveGroup);
+// Where a dungeon is, is borrowed by everything that happened inside it and
+// has nowhere else to be drawn: a death in there is handed the dungeon's
+// position, so is a respawn, and so is the end of any jump that crossed into
+// it. So moving the dungeon has to move all three, and the drag moved only
+// the pin and the path -- reported as the teleport marker staying where it
+// was after the place it belonged to had been dragged away from under it.
+// The same shape of mistake as a marker checkbox reaching one of the two
+// places a mark is drawn, and the same answer: say all of it in one place.
+async function afterPlacing() {
+  await loadInteriors();
+  await loadDeaths();
+  await loadWarps();
+}
+
+// How many points of tail are kept. Everything older has been committed and
+// comes back from the server on the next reload.
+const LIVE_MAX = 4000;
+
+// How often the colours are brought up to date. The ramp moves at the speed a
+// route is walked, so a second is far finer than the eye needs and the pass
+// costs a fraction of a millisecond.
+const RECOLOUR_MS = 1000;
+
+// How heavy the line still being written is drawn. A little more than the
+// route it is extending, so the newest stretch reads as the live one -- and
+// one rule for both tails, because the surface one had it frozen at 3.5.
+// That is this at the default thickness and nothing like it at any other, so
+// with the slider at 8 the committed route was 8 and everything since your
+// last refetch was 3.5, which during play is everything since you last
+// happened to zoom. Nudging the slider fetched the route again and the tail
+// shrank to a couple of points, which is why the workaround was to "adjust it
+// back and forth".
+function liveWeight() {
+  return Math.max(1, state.weight) + 0.6;
+}
+
+function rememberTint(line, t) {
+  state.tinted.push({ line, t, colour: line.options.color });
 }
 
 function redrawLive() {
   // reload() rebuilds the route from the server, which does not know about
   // samples the recorder has not committed yet. The buffer survives that, and
-  // the polyline the websocket appends to is recreated here -- appending to a
-  // layer that had been cleared away was why the map stopped moving until you
-  // zoomed.
+  // the polylines the websocket appends to are recreated here -- appending to
+  // a layer that had been cleared away was why the map stopped moving until
+  // you zoomed.
+  //
+  // Banded like the rest of the route rather than drawn as one flat line.
+  // That was right while the tail was a second or two of uncommitted samples
+  // -- but nothing refetches the route while you play, so the tail is really
+  // everything since the last time you happened to zoom, and in one colour it
+  // says the gradient has stopped moving. Only under `by age`: in the other
+  // two modes the tail's brightness is what marks it as the live one, and
+  // neither of those colourings changes with time anyway.
   liveGroup.clearLayers();
+  state.liveRuns = [];
   state.liveLayer = null;
-  if (state.live && state.live.length) newLiveLine();
+  if (!state.live || !state.live.length) return;
+  if (state.live.length > LIVE_MAX) {
+    // Trimmed here rather than where the points are pushed, because the cut
+    // has to take the timestamps with it and the runs are built from both.
+    state.live = state.live.slice(-LIVE_MAX);
+    state.liveT = state.liveT.slice(-LIVE_MAX);
+  }
+  const pts = state.live;
+  const flat = state.tint !== 'age';
+  // A null in the buffer is a break -- a load screen, a teleport, coming back
+  // out of a dungeon -- and the line stops there rather than being drawn
+  // through it. It is a gap in the tail and not the end of it: everything
+  // since the last refetch is drawn *only* here.
+  const bands = flat ? null
+    : state.liveT.map((t) => (t === null ? null : ageBand(t)));
+  const runs = [];
+  let start = -1;
+  for (let i = 0; i <= pts.length; i++) {
+    const end = i === pts.length;
+    const gap = !end && pts[i] === null;
+    if (start < 0) {
+      if (!end && !gap) start = i;
+      continue;
+    }
+    // A run ends at a gap, at the end of the buffer, or where the band
+    // changes. Written as `!flat && bands[i] === bands[start]` the band test
+    // was false all the way down in the two modes that have no bands, so a
+    // 21-point tail came out as 21 polylines.
+    const bandEnds = !end && !gap && !flat && bands[i] !== bands[start];
+    if (!end && !gap && !bandEnds) continue;
+    // A change of colour shares its boundary point with the next run, so the
+    // line is never broken by it. A gap does not: breaking there is the
+    // point.
+    runs.push({ from: start, upto: bandEnds ? i + 1 : i, band: bands && bands[start] });
+    start = bandEnds ? i : -1;
+  }
+  const weight = liveWeight();
+  // Every outline first and every line after, for the reason the route keeps
+  // its casings in a group of their own: within one canvas the order they go
+  // on is the order they are painted, so a run's outline drawn after its
+  // neighbour's line would sit on top of it at the seam.
+  if (state.casing > 0) {
+    for (const r of runs) {
+      r.casing = L.polyline(pts.slice(r.from, r.upto), {
+        renderer, color: '#0d0b08', weight: weight + state.casing,
+        opacity: 0.55, lineJoin: 'round', lineCap: 'round',
+      }).addTo(liveGroup);
+    }
+  }
+  for (const r of runs) {
+    r.line = L.polyline(pts.slice(r.from, r.upto), {
+      renderer,
+      color: flat ? '#f7d488' : bandColor(r.band),
+      weight, opacity: 1, lineJoin: 'round',
+    }).addTo(liveGroup);
+    state.liveRuns.push(r);
+    if (!flat) rememberTint(r.line, state.liveT[r.from]);
+    state.liveLayer = r.line;
+  }
+}
+
+// The gradient is a statement about now, and now moves while you are playing.
+// Nothing was moving it: `state.span` is written by drawSegments(), which only
+// runs from reload(), and reload() only runs when you zoom or change a filter
+// -- so the ramp's near end sat where your last scroll left it and every
+// stretch kept the colour it was given then. Measured on a simulated session
+// with the horizon at fifteen minutes: over 131 seconds of recording the
+// newest end advanced 0 ms and not one of the drawn stretches changed colour,
+// and then a single scroll moved it 203 seconds and redrew the lot.
+//
+// A refetch is the wrong answer -- it is a hundred times the work to recover a
+// picture that is already on the screen. This is playRecolour()'s idea for the
+// map: work out what each stretch should be now and set only the ones that
+// have actually crossed into another band.
+function recolourRoute(force) {
+  const now = Date.now();
+  if (!force && now - state.tintedAt < RECOLOUR_MS) return;
+  state.tintedAt = now;
+  // The tail is rebuilt rather than restyled: its *bands* move as well as its
+  // colours, so where one run ends and the next begins is part of the answer.
+  // In the other modes it is one run that never changes colour, and the only
+  // reason to touch it is to hold it to its cap.
+  if (state.tint === 'age' || state.live.length > LIVE_MAX) redrawLive();
+  if (state.tint !== 'age') return;
+  // The legend says what the two ends of the gradient mean, so it is part of
+  // the same statement and goes stale in the same way.
+  if (state.hExtent) showRamp(state.hExtent[0], state.hExtent[1]);
+  let gone = 0;
+  for (const item of state.tinted) {
+    if (!item.line._map) { gone++; continue; }
+    const colour = bandColor(ageBand(item.t));
+    if (colour === item.colour) continue;
+    item.colour = colour;
+    item.line.setStyle({ color: colour });
+  }
+  // A drawing that has been taken off the map is not coming back: the group
+  // it was in was cleared and whatever replaced it registered itself.
+  if (gone) state.tinted = state.tinted.filter((i) => i.line._map);
 }
 
 function toLatLng(xy) {
@@ -2208,8 +3071,18 @@ function toLatLng(xy) {
 /* --- live feed ----------------------------------------------------------- */
 
 function connectLive() {
-  const ws = new WebSocket(`ws://${location.host}/ws`);
   const status = document.getElementById('status');
+  // A viewer serving a database is not a recorder. It answers the websocket
+  // like one -- the same server class serves both -- so the socket opened,
+  // said Live, and then nothing ever arrived on it: the page claiming to be
+  // watching a game that is not running. `meta.recording` is the session
+  // being written, or null, which is the question actually being asked.
+  if (!state.meta || !state.meta.recording) {
+    status.textContent = 'Offline map';
+    status.dataset.live = '0';
+    return;
+  }
+  const ws = new WebSocket(`ws://${location.host}/ws`);
 
   ws.onopen = () => { status.textContent = 'Live'; status.dataset.live = '1'; };
   ws.onclose = () => {
@@ -2241,6 +3114,9 @@ function connectLive() {
       // to have stopped recording -- and put the dungeon itself on screen.
       status.textContent = `Inside ${s.label || 'a dungeon'}`;
       status.dataset.live = '1';
+      // You moved. Whatever you stepped out to look at, you are walking
+      // again, and the cave is what you are walking in.
+      if (state.peek) setPeek(false);
       state.liveLayer = null;   // don't join the cave to the surface line
       if (!state.wasInside || state.insideMap !== s.map) {
         state.wasInside = true;
@@ -2298,15 +3174,37 @@ function connectLive() {
     if (s.layer !== state.plane) return;
 
     const here = toLatLng(s.xy);
-    if (s.break || !state.liveLayer) {
-      state.live = [];
-      newLiveLine();
+    // A break splits the line; it does not end the tail. Emptying the buffer
+    // here took every point of it off the map -- and the committed route does
+    // not cover those points until something refetches, so dying wiped the
+    // path back to wherever you last happened to zoom and zooming fetched it
+    // back. Reported as exactly that. The null is the same thing
+    // `state.liveInside` has always pushed for a load screen inside a
+    // dungeon.
+    const broke = (s.break || !state.liveLayer) && state.live.length > 0;
+    if (broke) {
+      state.live.push(null);
+      state.liveT.push(null);
     }
     state.live.push(here);
-    // Trimmed rather than unbounded: everything older has been committed and
-    // comes back from the server on the next reload.
-    if (state.live.length > 4000) state.live = state.live.slice(-4000);
-    state.liveLayer.setLatLngs(state.live);
+    state.liveT.push(s.t);
+    // The newest thing drawn on the map is now this sample, and the newest
+    // thing drawn is exactly what the age ramp is measured back from -- the
+    // wall clock is deliberately not used, or the whole route would slide into
+    // the oldest colour whenever the recorder was off. Without this line the
+    // near end of the gradient stayed wherever the last refetch put it.
+    if (state.span && s.t > state.span[1]) state.span[1] = s.t;
+    // The head follows the feed at once. The banding behind it is a second
+    // stale at worst, which is the recolour tick. A break is the one thing
+    // that cannot be appended to: the run it closed stays where it is and the
+    // next point needs one of its own, which costs the one rebuild.
+    const run = broke ? null : state.liveRuns[state.liveRuns.length - 1];
+    if (run) {
+      const pts = state.live.slice(run.from);
+      run.line.setLatLngs(pts);
+      if (run.casing) run.casing.setLatLngs(pts);
+    } else redrawLive();
+    recolourRoute();
     setYouMark(here, s);
   };
 }
@@ -2348,12 +3246,6 @@ const PLAY_GAP_CAP_MS = 10_000;
 // with the whole of routes.db drawn -- 3% of a second at this rate.
 const PLAY_TICK_MS = 16;          // wall clock between steps
 const PLAY_FLASH_MS = 1500;       // how long a death or a teleport announces
-// A jump bigger than this much of the screen is a leap, and the map is sent
-// straight there rather than gliding: a glide that the next tick interrupts
-// never arrives, which is what "it cannot keep up" was.
-const PLAY_LEAP_SHARE = 0.45;     // of the viewport's diagonal
-const PLAY_LEAP_MIN_PX = 200;
-
 // Easing off, on the other hand, belongs to the teleport and not to the
 // pixels. Measured over one playback of routes.db at zoom 8: the pixel rule
 // fired on 246 steps against 64 actual jumps, because at a close zoom every
@@ -2390,7 +3282,21 @@ function playBrakeFor(e) {
 
 const play = {
   on: false, timer: null, token: 0,
-  at: 0, to: 0, speed: 300,
+  // `at` is the clock and `to` is the whole route. `from` and `until` are the
+  // part of it the playback actually runs -- the two grips on the timeline --
+  // and they start out as the whole thing.
+  at: 0, to: 0, from: 0, until: 0, speed: 300,
+  // Run it again at the end grip rather than stopping. Remembered,
+  // because it is a way of watching rather than a thing you do once.
+  loop: false,
+  // Which way the clock runs. Forwards costs almost nothing -- the drawing
+  // only grows -- and backwards costs a rebuild a frame, for the reason
+  // `playSeek()` gives: the picture cannot be unwound, only replayed.
+  dir: 1,
+  // What the last of those rebuilds cost, so the next one can wait it out
+  // rather than pinning the thread.
+  seekMs: 0,
+  ticksOn: true,
   runs: [], events: [], axis: null,
   cursor: 0, event: 0,
   head: null,                     // the run currently half drawn
@@ -2408,8 +3314,8 @@ const play = {
   last: 0,                        // wall clock at the previous step
   onPlane: null,                  // and which map that point is drawn on
   plane0: null,                   // the plane to give back when this is over
-  lastAt: null,                   // where the mark was, to measure a leap
   brake: 0,                       // running slowly until this moment
+  centre: null,                   // where a jump in the air is going to land
   lines: [],                      // every stretch drawn, for recolouring
   rankNow: 1,                     // where the playhead sits among the samples
   tinted: 0,                      // when the colours were last brought up to date
@@ -2580,10 +3486,15 @@ function playEvents(frames) {
       out.push({ ts: w.ts, kind: 'warp', where: hit.key, label: w.map,
                  from: hit.f.tf(w.from_local[0], w.from_local[1]),
                  xy: hit.f.tf(w.local[0], w.local[1]), plane: hit.f.plane,
+                 // Carried so the popup can say this was a death: the jump
+                 // is what gets marked, and a transit's departure is not
+                 // the row before its arrival.
+                 from_ts: w.from_ts,
                  distance_m: w.distance_m, reason: w.reason });
     } else if (w.xy) {
       out.push({ ts: w.ts, kind: 'warp', where: 'world', label: w.map,
                  from: w.from_xy, xy: w.xy, plane: planeOf(w.layer),
+                 from_ts: w.from_ts,
                  distance_m: w.distance_m, reason: w.reason });
     }
   }
@@ -2744,6 +3655,17 @@ function playPlane(plane) {
     control('plane-' + k).classList.toggle('on', k === plane);
   }
   swapTiles(plane, control('plane-note'));
+  playRedrawPlane(plane);
+}
+
+// What is drawn, once the map underneath has changed. Its own function
+// because the tiles can be swapped by the playback following the route or by
+// you pressing Underground, and both have to take the drawing with them:
+// pressing it by hand swapped the terrain and left the whole of Limgrave
+// standing over Siofra with the river's own stretches never drawn, which is
+// the same mistake `state.live` made before it and the one `playPlane()` was
+// already written to avoid.
+function playRedrawPlane(plane) {
   if (!play.on || !play.marks) return;
   // The path belongs to the plane it was walked on. Leaving the surface route
   // drawn over Siofra is the mistake `state.live` once made, and it is worse
@@ -2821,9 +3743,6 @@ function playEnter(where, skip) {
     // The world, or a dungeon that is part of it. Nothing to reveal and
     // nothing to put back: the path simply carries on into the castle.
     dimBackground(false);
-    setCaption(where === 'world' ? null
-               : `Inside ${play.frames.get(where).label}, which is drawn on `
-                 + `the map where it stands.`);
     return;
   }
   dimBackground(true);
@@ -2838,7 +3757,11 @@ function playEnter(where, skip) {
       if (run.where === 'world') continue;
       const f = play.frames.get(run.where);
       if (!f || f.map_id !== frame.map_id) continue;
-      playLine(run, run.xy.length, run.where !== where);
+      // Not faint. Drawing the earlier runs at 0.4 was meant to keep this
+      // visit legible over them, and reads instead as the place fading out
+      // every time you step back into it: they are the same cave and the
+      // same walking, and there is nothing to rank one above the other.
+      playLine(run, run.xy.length, false);
     }
   }
   // And everything that happened in here on the way through, so a tally goes
@@ -2851,39 +3774,43 @@ function playEnter(where, skip) {
     if (!playSamePlace(where, e.where)) continue;
     playFlash(e, false);
   }
-  const runs = new Set();
-  for (let i = 0; i < play.cursor; i++) {
-    const f = play.frames.get(play.runs[i].where);
-    if (f && frame && f.map_id === frame.map_id) runs.add(play.runs[i].where);
-  }
-  const again = runs.size
-    ? ` \u2014 you have been in here ${runs.size === 1 ? 'once' : `${runs.size} times`}`
-      + ` before, drawn faintly`
-    : '';
-  setCaption(`Inside ${frame ? frame.label : 'a dungeon'} \u2014 drawn to the ` +
-             `map's scale, in the dungeon's own orientation${again}.`);
+  // No caption. Hovering a dungeon on the finished map is a question you
+  // asked and the caption is the answer; the playback walks into one every
+  // few seconds without being asked, and a box of text appearing and going
+  // again at the bottom of the map is something to read rather than
+  // something to watch. What it said is on the hover, where it was asked
+  // for.
 }
 
-// Which of the twelve age bands a stretch falls in *now* -- measured against
-// the playhead, not against the end of the route. So the newest thing drawn
-// is always in the newest colour, and what came before it slides down the
-// ramp as the playback goes on.
-function playBand(run) {
-  const p = play.rankNow > 0
+// Where a stretch sits on the age ramp *now* -- measured against the
+// playhead, not against the end of the route. So the newest thing drawn is
+// always in the newest colour, and what came before it slides down the ramp
+// as the playback goes on.
+function playAgeAt(run) {
+  return play.rankNow > 0
     ? Math.max(0, Math.min(1, run.rank / play.rankNow)) : 1;
-  return Math.min(11, Math.floor(p * 12));
 }
 
+// Not one of the twelve bands the finished map is drawn in. A band is a fact
+// about a route that has stopped changing; during playback the denominator
+// moves under every stretch at once, so twelve steps meant the whole path
+// changed colour together a few times a minute -- which is the snap. The ramp
+// is continuous here, and the only quantisation left is the eight bits the
+// colour is written in.
 function playColour(run) {
   return state.tint === 'age' && run.rank !== undefined
-    ? bandColor(playBand(run)) : run.colour;
+    ? ageColor(playAgeAt(run)) : run.colour;
 }
 
 // Bring the drawn stretches up to date with where the playhead is. Only worth
-// doing for the age ramp -- height and one colour do not move -- and only
-// every so often: one canvas holds the whole route, so any change to any
-// stretch costs a redraw of all of it.
-const PLAY_RECOLOUR_MS = 250;
+// doing for the age ramp -- height and one colour do not move.
+//
+// Every tick rather than four times a second, because that is what makes it a
+// drift rather than a step. It costs less than the throttle saved: a stretch
+// whose colour rounds to the same rgb() as last time is skipped, so what the
+// pass actually does per tick is recompute a number for each drawn stretch
+// and set a style on the few that crossed a value.
+const PLAY_RECOLOUR_MS = PLAY_TICK_MS;
 
 function playRecolour(force) {
   if (state.tint !== 'age') return;
@@ -2893,10 +3820,10 @@ function playRecolour(force) {
   let gone = 0;
   for (const item of play.lines) {
     if (!item.line._map) { gone++; continue; }
-    const band = playBand(item.run);
-    if (band === item.band) continue;
-    item.band = band;
-    item.line.setStyle({ color: bandColor(band) });
+    const colour = playColour(item.run);
+    if (colour === item.colour) continue;
+    item.colour = colour;
+    item.line.setStyle({ color: colour });
   }
   if (gone) play.lines = play.lines.filter((i) => i.line._map);
 }
@@ -2928,7 +3855,7 @@ function playLine(run, upto, faint, tip) {
   }
   const line = L.polyline(pts, style);
   line.addTo(open ? play.group : insideGroup);
-  play.lines.push({ run, line, band: run.rank !== undefined ? playBand(run) : -1 });
+  play.lines.push({ run, line, colour: style.color });
   return line;
 }
 
@@ -3022,6 +3949,42 @@ function playFlash(e, animate) {
     // Its own canvas, so drawing it and fading it out cost one line's worth
     // of repaint rather than the whole route's.
     if (animate) {
+      // The map is about to be sent somewhere it has never drawn, and a whole
+      // screen of tiles arriving at once is what the jump feels like it is
+      // waiting for. The line takes PLAY_TRAVEL_MS to get there, and the
+      // clock is eased for at least as long again, so there is time to pay
+      // for them before the map moves.
+      warmAhead(e.xy);
+      // And the map is sent there rather than shuffled the smallest distance
+      // that gets it inside the follow box. Following is right for walking --
+      // a few pixels at a time, and the ground you came from stays on screen
+      // -- and it is the wrong shape for a jump: the clock reaches the far
+      // end in one step, so the minimum pan leaves the place you have just
+      // arrived at pressed against whichever edge you came in by. The place
+      // a teleport put you is the whole of what there is to look at, so it
+      // goes in the middle.
+      //
+      // Armed here and applied when the line gets there, with the follow
+      // held in between: the departure lands, the line sets off from where
+      // you actually were, and the map arrives with it. Panning at once
+      // would take the end you left from off the screen before it had
+      // finished landing, which is the half of a jump this was all built to
+      // show.
+      // Only when the place it is taking you is not already on the screen.
+      // A jump you can see both ends of needs no help finding: throwing the
+      // map across for something that was already in front of you is the
+      // whole of "if you're teleporting to somewhere close by it can look a
+      // bit jarring". Left alone, the ordinary follow nudges it inside the
+      // edge margin if it needs to and does nothing at all if it does not.
+      if (state.follow && !map.getBounds().contains(toLatLng(e.xy))) {
+        // Where on the screen the end you are leaving from sits. Kept now
+        // rather than worked out on landing, because by then the follow has
+        // had four hundred milliseconds to move the map under it.
+        play.centre = { xy: e.xy, until: Date.now() + PLAY_TRAVEL_MS,
+                        at: state.holdSpot
+                          ? map.latLngToContainerPoint(toLatLng(e.from))
+                          : null };
+      }
       const arc = L.polyline([toLatLng(e.from), toLatLng(e.from)], {
         renderer: home ? arcRenderer : insideRenderer,
         pane: home ? 'playarc' : 'inside',
@@ -3043,7 +4006,9 @@ function playFlash(e, animate) {
   // The arrival lands when the line reaches it, not when it sets off.
   if (animate) {
     const wait = kind === 'warp' && e.from ? PLAY_TRAVEL_MS : 0;
-    if (wait) setTimeout(() => playLand(lasting), wait);
+    // The map arrives when the mark does, off the same timer, so a pause
+    // mid-jump still ends up looking at the place the jump went to.
+    if (wait) setTimeout(() => { playLand(lasting); playCentre(); }, wait);
     else playLand(lasting);
   }
   // A popup you have to chase across the map is no use, so watching stops
@@ -3057,6 +4022,10 @@ function playFlash(e, animate) {
 // reading the layout back before it goes on again -- and because a mark that
 // counts up needs to do it again on every arrival, not only the first.
 const PLAY_POP_MS = 420;
+// The speed the flash lengths were judged at. Above it a flash covers more
+// route than it is worth holding the drawing back for, so the hold shrinks in
+// proportion; at or below it nothing changes.
+const PLAY_HOLD_SPEED = 300;
 
 function playLand(mark) {
   const el = mark && mark._icon;
@@ -3115,6 +4084,45 @@ function playTravel(line, from, to) {
   }, 25);
 }
 
+// Put the arrival of a jump in the middle of the screen. Never animated, for
+// the reason the follow is not: the playback ticks every 16 ms and Leaflet
+// stops a running pan to start another, so an eased one would be restarted
+// before it could ever finish. Straight there, in one frame, is what the
+// tiles were warmed for.
+//
+// `setView` rather than `panTo`, and the difference is not cosmetic: `panTo`
+// puts the options under `pan` and leaves `animate` undefined at the top
+// level, so `panBy` animates after all. `setView` copies the flag down.
+function playCentre() {
+  const c = play.centre;
+  play.centre = null;
+  if (!c || !play.on || !state.follow) return;
+  const ll = toLatLng(c.xy);
+  const z = map.getZoom();
+  if (!c.at) {
+    map.setView(ll, z, { animate: false });
+    return;
+  }
+  // Asked for: "if you teleport from the bottom left of the screen, then the
+  // teleport-to marker should also be the bottom left of the screen, so you
+  // stay focused on the same spot while viewing."
+  //
+  // Clamped into the edge margin first. The departure is normally well inside
+  // it -- the follow keeps it there -- but a jump can fire on the frame the
+  // mark is still crossing it, and landing the arrival off the screen to
+  // honour where the departure was would be the opposite of the point.
+  const size = map.getSize();
+  const pad = effectivePad();
+  const at = L.point(
+    Math.min(Math.max(c.at.x, pad[0]), size.x - pad[0]),
+    Math.min(Math.max(c.at.y, pad[1]), size.y - pad[1]));
+  // One move, not a centring followed by a nudge: the container point of a
+  // projected point p is `p - project(centre) + size/2`, so the centre that
+  // puts the arrival at `at` is `project(arrival) - at + size/2`.
+  const centre = map.project(ll, z).subtract(at).add(size.divideBy(2));
+  map.setView(map.unproject(centre, z), z, { animate: false });
+}
+
 // A cave you have just walked into. Not draggable and not renameable the way
 // the map's own pin is -- this one is a record of having got there.
 function playPin(e, animate) {
@@ -3156,7 +4164,8 @@ function playMarkPopup(e, end) {
       `<span class="hint">${e.reason}` +
       ` \u2014 which is what a death looks like too</span>`,
       'This was a death',
-      () => { map.closePopup(); playReclassify({ ts: e.ts }); });
+      () => { map.closePopup();
+                playReclassify({ ts: e.ts, from_ts: e.from_ts }); });
   }
   if (e.by_hand) {
     return popupWithAction(
@@ -3218,7 +4227,13 @@ async function playRebuild(atClock) {
   play.axis = script.axis;
   play.frames = script.frames;
   play.to = script.axis.total;
+  // Marking a death rebuilds the axis, and it can come out a little shorter
+  // or longer. The trim is kept where it was in real terms and clamped into
+  // whatever the new axis turned out to be.
+  play.until = Math.min(play.until || play.to, play.to);
+  play.from = Math.max(0, Math.min(play.from, play.until));
   playTicks();
+  playTrimUI();
   playSeek(playElapsedFor(atClock));
 }
 
@@ -3274,14 +4289,36 @@ async function playReclassify(body) {
                       : 'Marked as a death; the respawn is at the other end.');
 }
 
-function playToll(n) {
+function playRepeatUI() {
+  const rep = control('play-repeat');
+  if (rep.classList) rep.classList.toggle('on', play.loop);
+  if (rep.setAttribute) rep.setAttribute('aria-pressed', String(play.loop));
+}
+
+// The two other modes on the bar. A pressed state rather than a label that
+// changes: what they show is the way the playback is set.
+function playModesUI() {
+  const rev = control('play-rev');
+  if (rev.classList) rev.classList.toggle('on', play.dir < 0);
+  if (rev.setAttribute) rev.setAttribute('aria-pressed', String(play.dir < 0));
+  const tk = control('play-ticks-on');
+  if (tk.classList) tk.classList.toggle('off', !play.ticksOn);
+  if (tk.setAttribute) tk.setAttribute('aria-pressed', String(play.ticksOn));
+  const box = control('play-ticks');
+  if (box.hidden !== undefined) box.hidden = !play.ticksOn;
+}
+
+function playToll(n, animate) {
   const rose = n > play.deaths;
   play.deaths = n;
   control('toll-n').textContent = String(n);
   const box = control('toll');
-  // Only on the way up. playReset() calls this with 0, and a seek is a reset
-  // -- so dragging the scrubber set the whole thing flashing on every frame.
-  if (rose && box.classList) {
+  // Only on the way up, and only while the clock is running. A seek is a
+  // reset followed by a replay of every death up to the target, so the count
+  // goes 0 -> N on every single one -- which is a rise, and had the whole
+  // badge flaring through a scrub as if you were dying all the way along it.
+  // The number still lands; it is the announcement that belongs to the moment.
+  if (rose && animate && box.classList) {
     box.classList.remove('bump');
     // Reading offsetWidth is what restarts the animation: without it the
     // class goes back on in the same frame it came off and nothing replays.
@@ -3308,8 +4345,8 @@ function playReset() {
   play.here = null;
   play.onPlane = null;
   play.clocked = 0;
-  play.lastAt = null;
   play.brake = 0;
+  play.centre = null;
   play.lines.length = 0;
   play.tinted = 0;
   playToll(0);
@@ -3332,6 +4369,7 @@ function playDrawTo(elapsed, animate) {
   // the mark sat still. Which is what put a death marked by hand a point away
   // from where the mark was standing: the death goes where the clock is.
   play.here = null;
+  let pending = null;
   while (play.cursor < play.runs.length) {
     const run = play.runs[play.cursor];
     if (run.t[0] > now) break;
@@ -3366,16 +4404,16 @@ function playDrawTo(elapsed, animate) {
     // `|| tip` and not `n > 1` alone: a run reached at its first point now has
     // a line to draw as soon as the clock is any way into it, instead of
     // nothing on screen until the second point is passed.
-    if (n > 1 || tip) {
-      if (play.head && play.head.run === run) {
-        const pts = run.xy.slice(0, n);
-        if (tip) pts.push(tip);
-        play.head.line.setLatLngs(pts.map(toLatLng));
-      } else {
-        const line = playLine(run, n, false, tip);
-        play.head = line ? { run, line } : null;
-      }
-    }
+    //
+    // Held rather than drawn here, because `playEnter()` below clears the
+    // group an interior head lives in and then puts back only the runs that
+    // are *finished* -- so the one being walked was drawn, cleared, and never
+    // redrawn. While playing that costs a frame and nobody sees it; on a seek
+    // `playDrawTo` is called once, and the result was a cave with a position
+    // mark moving through it and no path behind it, until an event or a
+    // finished run happened to put one back. Reported as exactly that, and as
+    // "every cave has the scrub issue".
+    if (n > 1 || tip) pending = { run, n, tip };
     break;
   }
 
@@ -3387,14 +4425,29 @@ function playDrawTo(elapsed, animate) {
 
   // Where the clock says you are -- unless something just happened somewhere
   // else and is still being shown. See the hold below.
+  const place = playPlaceAt(now);
   const holding = play.hold && Date.now() < play.hold.until;
   if (!holding) {
-    const place = playPlaceAt(now);
     // Which places the clock itself has put on screen, as opposed to ones an
     // event dragged the drawing into. The hold below is the only reason that
     // difference matters, and it is the whole of it.
     play.shown.add(place);
     if (place !== play.where) playEnter(place);
+  }
+
+  // Now that the drawing is in the right place, the run being walked can go
+  // on top of it. Only this one is ever redrawn, which is what lets a route
+  // of forty thousand points be played at all.
+  if (pending) {
+    const { run, n, tip } = pending;
+    if (play.head && play.head.run === run) {
+      const pts = run.xy.slice(0, n);
+      if (tip) pts.push(tip);
+      play.head.line.setLatLngs(pts.map(toLatLng));
+    } else {
+      const line = playLine(run, n, false, tip);
+      play.head = line ? { run, line } : null;
+    }
   }
 
   let died = play.deaths;
@@ -3437,9 +4490,19 @@ function playDrawTo(elapsed, animate) {
       // route time, and 25 of the 80 marks made inside a dungeon in routes.db
       // fall in the last step of the visit they belong to. Dropping the hold
       // outright would stop announcing all of them.
+      // And measured against the route it lets pass, not against the wall.
+      // A flash is a second and a half whatever the speed -- which at five
+      // minutes a second is seven minutes of route and reads as intended,
+      // and at an hour a second is an hour and a half of it. The whole route
+      // is fifteen seconds at that speed, so holding the drawing for a flash
+      // is holding it a tenth of the playback behind the clock: the dot is
+      // out in the open and the world is still dark for the cave it left.
+      // Reported as exactly that. Scaled below the speed the flash was
+      // judged at, so nothing changes at or under it.
+      const span = play.shown.has(e.where) ? PLAY_POP_MS : PLAY_FLASH_MS;
       play.hold = {
         until: Date.now()
-               + (play.shown.has(e.where) ? PLAY_POP_MS : PLAY_FLASH_MS),
+               + span * Math.min(1, PLAY_HOLD_SPEED / (play.speed || 1)),
       };
     }
     // A teleport is the thing worth easing off for, so it is the thing that
@@ -3454,27 +4517,12 @@ function playDrawTo(elapsed, animate) {
     playFlash(e, animate);
     if (e.kind === 'death') died++;
   }
-  if (died !== play.deaths) playToll(died);
+  if (died !== play.deaths) playToll(died, animate);
 
   // Where you are, on whichever plane you are on.
   const at = playHeadPoint();
   if (at) {
     const ll = toLatLng(at);
-    // How far the mark has moved across the screen. A teleport at a close
-    // zoom can put it most of a map away, and then the follow pan spends the
-    // next several ticks chasing it -- restarted every tick, so it never
-    // arrives, which is what "it cannot keep up" looks like.
-    let leap = 0;
-    if (play.lastAt) {
-      const a = map.latLngToContainerPoint(toLatLng(play.lastAt));
-      const b = map.latLngToContainerPoint(ll);
-      const size = map.getSize();
-      const far = Math.max(PLAY_LEAP_MIN_PX,
-                           Math.hypot(size.x, size.y) * PLAY_LEAP_SHARE);
-      const px = Math.hypot(a.x - b.x, a.y - b.y);
-      if (px > far) leap = px;
-    }
-    play.lastAt = at;
     play.mark.setLatLng(ll);
     // Only on the map it is actually on. With the switch turned off the route
     // carries on underground while the map stays up here, and a dot wandering
@@ -3482,11 +4530,30 @@ function playDrawTo(elapsed, animate) {
     const showMark = !play.onPlane || play.onPlane === state.plane;
     if (showMark && !play.mark._map) play.mark.addTo(map);
     if (!showMark && play.mark._map) play.mark.remove();
-    if (state.follow) {
-      // A long way is gone to at once. Animating it means watching the map
-      // scroll across the world while the playback runs on ahead, and the
-      // next tick interrupts the glide anyway.
-      map.panInside(ll, { padding: effectivePad(), animate: !leap });
+    // Held while a jump is in the air, so the map does not creep towards the
+    // arrival and then jump again when the line lands. playCentre() is what
+    // ends it, and it clears the hold whether it moves the map or not.
+    const flying = play.centre && Date.now() < play.centre.until;
+    if (state.follow && !flying) {
+      // Never animated, and that is the whole of what made following feel
+      // choppy. Leaflet's animated `panBy` eases over 250 ms, and
+      // `PosAnimation.run()` stops whatever is running before it starts --
+      // so at a 16 ms tick each pan was cancelled and restarted fifteen
+      // times before it could finish. The map was always part-way through
+      // an ease that never completed: it lagged the mark and juddered while
+      // it did. Checked in the running viewer -- an animation begun by one
+      // tick is still in progress when the next tick's call arrives.
+      //
+      // Unanimated, `panInside` applies exactly the offset needed, in the
+      // same frame as the mark it is following, so it cannot lag and there
+      // is nothing to interrupt. A few pixels sixty times a second is what
+      // a smooth pan is.
+      //
+      // It takes the leap case with it. `panBy` with `animate` not true
+      // sends the map straight there when the offset is wider than the
+      // viewport, which is what the measured-in-pixels leap test was
+      // written to do -- Leaflet was always going to do it for us.
+      map.panInside(ll, { padding: effectivePad(), animate: false });
     }
   }
   // Last, so everything drawn this step is included, and forced on a seek so
@@ -3512,10 +4579,24 @@ const PLAY_SPEEDS = [30, 45, 60, 90, 120, 180, 300, 450, 600,
                      900, 1200, 1800, 2700, 3600];
 const PLAY_SPEED_DEFAULT = 300;
 
+// How much route goes past in a second, which is the thing you are actually
+// choosing. The multiplier says the same in fewer characters and it is the
+// worse reading of the two: nothing else on the screen is in multiples of
+// real time, so x300 has to be converted before it means anything, while
+// "5 min a second" is already the answer. The multiplier is on the hover.
+//
+// Not rounded to whole minutes: three of the fourteen detents are halves, so
+// rounding would have 90 read as "2 min" next to a hover saying x90.
 function speedLabel(s) {
-  if (s < 60) return `${s} seconds a second`;
-  if (s < 3600) return `${Math.round(s / 60)} min a second`;
-  return '1 hour a second';
+  if (s < 60) return `${s} sec a second`;
+  if (s === 3600) return '1 hour a second';
+  return `${+(s / 60).toFixed(1)} min a second`;
+}
+
+// And how many times faster than you walked it, for the hover: 300 seconds of
+// route in a second is 300x real time.
+function speedLong(s) {
+  return `\u00d7${s} real time`;
 }
 
 // The stored preference is still seconds a second, because that is what it
@@ -3610,8 +4691,7 @@ function playHover(latlng) {
   control('map').classList.toggle('on-path', !!hit);
   if (!hit) { el.hidden = true; return; }
   const at = play.to ? playElapsedFor(hit.ts) / play.to : 0;
-  el.style.left = `calc(${PLAY_THUMB_PX / 2}px + `
-                  + `(100% - ${PLAY_THUMB_PX}px) * ${at.toFixed(5)})`;
+  el.style.left = playTrackAt(at);
   el.dataset.when = new Date(hit.ts).toLocaleString();
   el.title = `Go to ${new Date(hit.ts).toLocaleString()}`;
   el.hidden = false;
@@ -3620,6 +4700,112 @@ function playHover(latlng) {
 function playGoToHover() {
   if (play.hoverTs === null || play.hoverTs === undefined) return;
   playSeek(playElapsedFor(play.hoverTs));
+}
+
+// Where on the track a fraction of the route falls. The thumb travels between
+// its own half-widths, so everything drawn on the track is inset by the same
+// amount or it lines up with nothing.
+function playTrackAt(f) {
+  return `calc(${PLAY_THUMB_PX / 2}px + `
+         + `(100% - ${PLAY_THUMB_PX}px) * ${Math.max(0, Math.min(1, f)).toFixed(5)})`;
+}
+
+// The two grips, and the shading over the part of the route they cut off.
+function playTrimUI() {
+  const a = play.to ? play.from / play.to : 0;
+  const b = play.to ? play.until / play.to : 1;
+  const grip = (id, f) => { const el = control(id); if (el.style) el.style.left = playTrackAt(f); };
+  grip('trim-a', a);
+  grip('trim-b', b);
+  const cutA = control('trim-cut-a');
+  const cutB = control('trim-cut-b');
+  if (cutA.style) cutA.style.width = playTrackAt(a);
+  if (cutB.style) cutB.style.left = playTrackAt(b);
+  const box = control('play-trim');
+  // Nothing trimmed is the ordinary case, and a shading of zero width either
+  // side of it should not put two bright handles on a bar that means nothing
+  // yet -- so the whole thing sits back until it has something to say.
+  if (box.classList) box.classList.toggle('whole', a <= 0 && b >= 1);
+}
+
+// One grip moved, as a fraction of the whole route.
+//
+// They may not cross, and they may not come closer than the width of a thumb:
+// two grips on one pixel cannot be told apart, and a window narrower than the
+// thumb is one you cannot put the playhead inside.
+function playSetTrim(which, f, span) {
+  if (!play.to) return;
+  const gap = span > 0 ? PLAY_THUMB_PX / span : 0.02;
+  if (which === 'from') {
+    play.from = Math.max(0, Math.min(f, play.until / play.to - gap)) * play.to;
+  } else {
+    play.until = Math.min(1, Math.max(f, play.from / play.to + gap)) * play.to;
+  }
+  playTrimUI();
+  // The clock has to be somewhere the playback will actually go. Dragging a
+  // grip past the playhead moves the playhead, rather than leaving it outside
+  // the thing it is the playhead of.
+  if (play.at < play.from || play.at > play.until) {
+    playSeek(play.at < play.from ? play.from : play.until);
+  } else {
+    playClockText(play.at, playClock(play.at));
+  }
+}
+
+function wireTrim() {
+  const track = document.querySelector('.play-track');
+  if (!track) return;
+  for (const [id, which] of [['trim-a', 'from'], ['trim-b', 'until']]) {
+    const grip = control(id);
+    if (!grip.addEventListener) continue;
+    const measure = (clientX) => {
+      const r = track.getBoundingClientRect();
+      const span = r.width - PLAY_THUMB_PX;
+      let f = span > 0 ? (clientX - r.left - PLAY_THUMB_PX / 2) / span : 0;
+      // Snapped at the ends, so putting a grip back where it started is a
+      // flick rather than an exercise in single pixels.
+      if (f < 0.01) f = 0;
+      if (f > 0.99) f = 1;
+      playSetTrim(which, f, span);
+    };
+    // A flag rather than the capture, and the moves come off the window. A
+    // drag does not stay inside a nine-pixel handle, and pointer capture is
+    // the browser's way of saying so -- but it is an optimisation here, not
+    // the mechanism: asking `hasPointerCapture` made the drag depend on it,
+    // and anything that cannot grant it (a synthetic event, an old browser)
+    // got a grip that could be pressed and not moved.
+    let held = false;
+    const stop = (ev) => {
+      if (!held) return;
+      held = false;
+      grip.classList.remove('held');
+      try { grip.releasePointerCapture(ev.pointerId); } catch (e) { /* none */ }
+    };
+    grip.addEventListener('pointerdown', (ev) => {
+      held = true;
+      grip.classList.add('held');
+      try { grip.setPointerCapture(ev.pointerId); } catch (e) { /* no capture */ }
+      ev.preventDefault();
+      ev.stopPropagation();
+    });
+    window.addEventListener('pointermove', (ev) => { if (held) measure(ev.clientX); });
+    window.addEventListener('pointerup', stop);
+    window.addEventListener('pointercancel', stop);
+    // A grip you can reach with the keyboard, since it is a button and looks
+    // like one. A step of a hundredth of the route, ten with shift.
+    grip.addEventListener('keydown', (ev) => {
+      const r = track.getBoundingClientRect();
+      const span = r.width - PLAY_THUMB_PX;
+      const now = (which === 'from' ? play.from : play.until) / (play.to || 1);
+      const step = (ev.shiftKey ? 0.1 : 0.01);
+      if (ev.key === 'ArrowLeft') playSetTrim(which, now - step, span);
+      else if (ev.key === 'ArrowRight') playSetTrim(which, now + step, span);
+      else if (ev.key === 'Home') playSetTrim(which, 0, span);
+      else if (ev.key === 'End') playSetTrim(which, 1, span);
+      else return;
+      ev.preventDefault();
+    });
+  }
 }
 
 function playTicks() {
@@ -3631,28 +4817,90 @@ function playTicks() {
     const at = playElapsedFor(e.ts) / play.to;
     if (at < 0 || at > 1) continue;
     const i = document.createElement('i');
-    i.style.left = `calc(${PLAY_THUMB_PX / 2}px + `
-                   + `(100% - ${PLAY_THUMB_PX}px) * ${at.toFixed(5)})`;
+    i.style.left = playTrackAt(at);
     i.title = new Date(e.ts).toLocaleString();
     marks.push(i);
   }
   box.replaceChildren(...marks);
 }
 
+// How long the playback still has to run, in wall-clock milliseconds.
+//
+// The route left over the speed is only the half of it the clock controls.
+// The playback also eases off at every teleport, running at PLAY_BRAKE_RATE
+// for the length of each one, and that is not a rounding error: measured at
+// an hour a second, where the whole route is 15.7 s of clock, the brakes add
+// 28.4 s at zoom 3 and 52.5 s at zoom 8. Counting only the clock is why the
+// number read low and then sat there refusing to reach zero.
+//
+// The brakes ahead are all computable, because a brake's length comes from
+// how far its jump is on screen and nothing else. They are merged the way
+// the tick merges them -- `play.brake` is a Math.max, so two jumps arriving
+// together are one brake -- and each one pushes the ones after it further
+// out, which is why this is a forward pass rather than a sum.
+function playTimeLeft(elapsed) {
+  const wall = Math.max(0, (play.until - elapsed) / play.speed);
+  if (!play.events || !play.events.length) return wall;
+  let extra = 0;     // wall ms the easing ahead will add
+  let until = -1;    // how far the brake running at that point reaches
+  for (let i = play.event; i < play.events.length; i++) {
+    const e = play.events[i];
+    if (markKind(e) !== 'warp') continue;
+    const el = playElapsedFor(e.ts);
+    if (el > play.until) break;      // past the end of what will be played
+    const at = (el - elapsed) / play.speed + extra;
+    if (at < 0) continue;
+    const end = at + playBrakeFor(e);
+    if (end <= until) continue;
+    extra += (end - Math.max(until, at)) * (1 - PLAY_BRAKE_RATE);
+    until = end;
+  }
+  return wall + extra;
+}
+
+// Said the way you would say it, because it is a length of time to sit
+// through rather than a figure to compare: "2 min 34 seconds", not "154s".
+function playLeftText(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s >= 3600) {
+    const h = Math.floor(s / 3600);
+    return `${h} hr ${Math.round((s % 3600) / 60)} min left`;
+  }
+  if (s >= 60) {
+    const r = s % 60;
+    return `${Math.floor(s / 60)} min ${r} second${r === 1 ? '' : 's'} left`;
+  }
+  return `${s} second${s === 1 ? '' : 's'} left`;
+}
+
 function playClockText(elapsed, now) {
-  const done = play.to ? elapsed / play.to : 1;
-  const left = Math.max(0, Math.round((play.to - elapsed) / play.speed / 1000));
+  // How far through the *playback*, which is the window between the grips and
+  // not the whole route: trim off the first three weeks and you want to know
+  // how much of what you asked for is left, not how much of what you did not.
+  const span = Math.max(1, play.until - play.from);
+  const done = Math.max(0, Math.min(1, (elapsed - play.from) / span));
   const i = play.axis ? axisIndex(play.axis.el, elapsed) + 1 : 0;
   const of = play.axis ? play.axis.ts.length : 0;
+  // Beside the play button rather than tucked on the end of the counting: it
+  // is the one number you look at to decide whether to sit through the rest.
+  control('play-left').textContent = playLeftText(playTimeLeft(elapsed));
   setClock(new Date(now).toLocaleString(),
            `${Math.round(done * 100)}% \u00b7 point ${i.toLocaleString()} of `
-           + `${of.toLocaleString()} \u00b7 ${left}s left`);
+           + `${of.toLocaleString()}`);
+  // The thumb, though, is placed against the whole route. The track is a
+  // picture of everything recorded with a window drawn on it, so a thumb
+  // measured against the window would sit somewhere the grips disagree with.
+  const whole = play.to ? Math.max(0, Math.min(1, elapsed / play.to)) : 0;
   const scrub = control('play-scrub');
-  if (!play.scrubbing) scrub.value = String(Math.round(done * 1000));
+  if (!play.scrubbing) scrub.value = String(Math.round(whole * 1000));
   // Chrome will not fill the played part of a range input, so the track
   // paints it as a gradient stop and this is what moves it. Set from the
-  // clock rather than from the drag, so it follows a seek as well.
-  scrub.style.setProperty('--done', `${(done * 100).toFixed(2)}%`);
+  // clock rather than from the drag, so it follows a seek as well. Two stops
+  // now: the fill starts at the grip, because the route before it is not
+  // something the playback has drawn.
+  const start = play.to ? Math.max(0, Math.min(1, play.from / play.to)) : 0;
+  scrub.style.setProperty('--start', `${(start * 100).toFixed(2)}%`);
+  scrub.style.setProperty('--done', `${(whole * 100).toFixed(2)}%`);
 }
 
 /* --- the mode ------------------------------------------------------------ */
@@ -3673,13 +4921,26 @@ function togglePlayback() {
   if (play.on) exitPlayback(); else enterPlayback();
 }
 
+// The marker switches during playback. They belong to the finished map: the
+// playback puts its marks down as they happen, out of its own script, and
+// unticking Deaths while it runs clears a group it is not drawing into and
+// changes nothing you can see. Off rather than absent, so the section still
+// says what the map will look like when you come back to it.
+function playLockMarks(on) {
+  for (const id of ['l-interior', 'l-deaths', 'l-respawns', 'l-warps']) {
+    const el = document.getElementById(id);
+    if (el) el.disabled = on;
+  }
+}
+
 function playButton(state) {
   const b = control('play');
   b.disabled = state === 'building';
   b.classList.toggle('on', state === 'playing');
-  b.textContent = state === 'building' ? 'Building\u2026'
-                : state === 'playing' ? 'Back to the map'
-                : 'Play the route back';
+  const label = b.querySelector ? b.querySelector('.lbl') : null;
+  (label || b).textContent = state === 'building' ? 'Building\u2026'
+                           : state === 'playing' ? 'Back to the map'
+                           : 'Route Playback';
 }
 
 async function enterPlayback() {
@@ -3701,13 +4962,19 @@ async function enterPlayback() {
   play.axis = script.axis;
   play.frames = script.frames;
   play.to = script.axis.total;
+  // A fresh playback plays the whole route. Carrying a trim over from the
+  // last one would be a setting you cannot see until you press play.
+  play.from = 0;
+  play.until = play.to;
   play.at = 0;
+  playTrimUI();
 
   play.plane0 = state.plane;
   hideInside(true);
   stopLiveInside();
   for (const g of playLayers()) map.removeLayer(g);
   document.body.classList.add('playing');
+  playLockMarks(true);
   play.group = L.layerGroup().addTo(map);
   play.marks = L.layerGroup().addTo(map);
   play.insideMarks = L.layerGroup().addTo(map);
@@ -3750,6 +5017,7 @@ function exitPlayback() {
   control('play-ticks').replaceChildren();
   playHover(null);
   document.body.classList.remove('playing');
+  playLockMarks(false);
   for (const g of playLayers()) g.addTo(map);
   redrawEverything();
 }
@@ -3769,13 +5037,17 @@ function playPause() {
 
 function playResume() {
   if (!play.on || play.timer) return;
-  if (play.at >= play.to) playSeek(0);
+  // At the end it has run to, whichever end that is.
+  if (play.dir < 0 ? play.at <= play.from : play.at >= play.until) {
+    playSeek(play.dir < 0 ? play.until : play.from);
+  }
   const b = control('play-toggle');
   b.innerHTML = '&#9208;&#65038;';
   b.title = 'Pause (space)';
   b.setAttribute('aria-label', 'Pause');
   b.classList.add('on');
   play.last = Date.now();
+  play.last0 = 0;
   play.timer = setInterval(() => {
     // Advanced by the time that actually passed, not by the nominal tick: a
     // timer asked for every 16 ms does not get every 16 ms, and stepping the
@@ -3794,24 +5066,75 @@ function playResume() {
     // Eased off after a teleport, rather than stopped: a playback that halts
     // reads as broken, one that slows reads as arriving.
     const rate = wall < play.brake ? PLAY_BRAKE_RATE : 1;
-    play.at = Math.min(play.to, play.at + play.speed * dt * rate);
-    playDrawTo(play.at, true);
-    if (play.at >= play.to) {
-      playPause();
-      setClock('Finished',
-               `${play.deaths} death${play.deaths === 1 ? '' : 's'}`
-               + ' \u00b7 Play runs it again.');
+    if (play.dir < 0) {
+      // Backwards is a seek a frame, and a seek on this route measures 69 ms
+      // median and 117 at the far end. Left to itself that fills the thread
+      // and the controls stop answering, so a tick is skipped until as long
+      // again has passed as the last rebuild took: half the thread to the
+      // playback, half to everything else. The clock is stepped by the wall
+      // time either way, so what this costs is frames and not speed.
+      if (wall - play.last0 < play.seekMs) return;
+      play.last0 = wall;
+      play.at = Math.max(play.from, play.at - play.speed * dt * rate);
+      const t0 = performance.now();
+      playSeek(play.at);
+      play.seekMs = performance.now() - t0;
+    } else {
+      play.at = Math.min(play.until, play.at + play.speed * dt * rate);
+      playDrawTo(play.at, true);
+    }
+    const done = play.dir < 0 ? play.at <= play.from : play.at >= play.until;
+    if (done) {
+      // Round again from the other grip -- whichever end that is. `playSeek()`
+      // is a rebuild and not a rewind, and it leaves the timer alone, so this
+      // is the whole of it.
+      if (play.loop) playSeek(play.dir < 0 ? play.until : play.from);
+      else {
+        playPause();
+        setClock('Finished',
+                 `${play.deaths} death${play.deaths === 1 ? '' : 's'}`
+                 + ' \u00b7 Play runs it again.');
+      }
     }
   }, PLAY_TICK_MS);
 }
 
 function playSeek(elapsed) {
   playReset();
-  play.at = Math.max(0, Math.min(play.to, elapsed));
+  // Into the window, not into the route. Dragging the thumb past a grip is
+  // asking for a moment that is not part of this playback, and the honest
+  // answer is the nearest one that is.
+  play.at = Math.max(play.from, Math.min(play.until, elapsed));
   playDrawTo(play.at, false);
 }
 
 function wirePlayback() {
+  wireTrim();
+  // A mode, so it says which way it is set rather than what pressing it would
+  // do -- the same reasoning as the plane buttons and the marker checkboxes.
+  const rep = control('play-repeat');
+  play.loop = pref('loop') === 'true';
+  playRepeatUI();
+  rep.addEventListener('click', () => {
+    play.loop = !play.loop;
+    savePref('loop', play.loop);
+    playRepeatUI();
+  });
+  // Direction, and whether the deaths are drawn on the track. Both are modes
+  // and both are remembered, for the same reason repeat is.
+  play.dir = pref('dir') === '-1' ? -1 : 1;
+  play.ticksOn = pref('ticks') !== 'false';
+  playModesUI();
+  control('play-rev').addEventListener('click', () => {
+    play.dir = -play.dir;
+    savePref('dir', play.dir);
+    playModesUI();
+  });
+  control('play-ticks-on').addEventListener('click', () => {
+    play.ticksOn = !play.ticksOn;
+    savePref('ticks', play.ticksOn);
+    playModesUI();
+  });
   control('play').addEventListener('click', togglePlayback);
   control('play-died').addEventListener('click', playDiedHere);
   control('play-hover').addEventListener('click', playGoToHover);
@@ -3829,6 +5152,8 @@ function wirePlayback() {
   const setSpeed = (save) => {
     play.speed = PLAY_SPEEDS[+speed.value] || PLAY_SPEED_DEFAULT;
     rate.textContent = speedLabel(play.speed);
+    rate.dataset.long = speedLong(play.speed);
+    speed.title = speedLong(play.speed);
     if (save) savePref('playSpeed', String(play.speed));
     if (play.on) playClockText(play.at, playClock(play.at));
   };
@@ -3868,6 +5193,18 @@ function wirePlayback() {
     if (!play.on) return;
     if (ev.target && /^(INPUT|SELECT|TEXTAREA)$/.test(ev.target.tagName)) return;
     if (ev.key === 'Escape') { exitPlayback(); ev.preventDefault(); }
+    if (ev.key === 'r' || ev.key === 'R') {
+      control('play-repeat').click();
+      ev.preventDefault();
+    }
+    if (ev.key === 'b' || ev.key === 'B') {
+      control('play-rev').click();
+      ev.preventDefault();
+    }
+    if (ev.key === 't' || ev.key === 'T') {
+      control('play-ticks-on').click();
+      ev.preventDefault();
+    }
     if (ev.key === 'd' || ev.key === 'D') {
       playDiedHere();
       ev.preventDefault();
@@ -3945,11 +5282,49 @@ function redrawLiveInside() {
     renderer: insideRenderer,
     pane: 'inside',
     color: state.tint === 'solid' ? state.colour : '#f7d488',
-    weight: Math.max(1, state.weight) + 0.6,
+    weight: liveWeight(),
     opacity: 1,
     lineJoin: 'round',
     lineCap: 'round',
   }).addTo(insideLiveGroup);
+}
+
+// Looking at the world from inside a cave.
+//
+// The overlay is the right thing to be shown while you are in one -- the
+// path is in the dungeon's own metres and there is nothing else to draw it
+// on -- but it dims the world and covers the ground the cave sits under, and
+// sometimes that ground is the thing you want. This takes the overlay down
+// without pretending you have left.
+//
+// It comes back when you move. Every sample the recorder sends is a sample it
+// stored, which is to say a sample where you had moved `min_move_m` since the
+// last one, so "the next sample" and "you started walking again" are the same
+// event -- and being left looking at the world with your own position mark
+// nowhere on it is not a state to end up in by accident.
+function setPeek(on) {
+  state.peek = on;
+  peekFace();
+  if (on) hideInside(true);
+  else refreshLiveInside();
+}
+
+function peekFace() {
+  const b = control('peek');
+  if (!b.classList) return;
+  b.textContent = state.peek ? 'Back to the cave' : 'Show outside';
+  b.classList.toggle('on', state.peek);
+}
+
+// Whether the button is on offer at all: only while a cave is actually being
+// drawn over the world. A legacy dungeon is on the map in the open, so there
+// is no overlay to take down and nothing to show you that is not already
+// there.
+function peekOffer(show) {
+  const b = control('peek');
+  if (!show && state.peek) state.peek = false;
+  b.hidden = !show;
+  peekFace();
 }
 
 async function startLiveInside(mapStr) {
@@ -3965,6 +5340,7 @@ async function startLiveInside(mapStr) {
 function stopLiveInside() {
   clearInterval(state.insideTimer);
   state.insideTimer = null;
+  peekOffer(false);
   // Anything already in flight is now answering a question about a dungeon
   // you have left. Without this, walking out during a refresh let the
   // continuation come back and put the overlay up again -- pinned, because
@@ -3991,6 +5367,7 @@ async function refreshLiveInside(mapStr) {
     inside.cache.delete(insideKey(open));   // it is still being written
     inside.live = true;
     if (open.world_visible) {
+      peekOffer(false);
       // Its path is on the map already, along with every other run through
       // the place. Redraw those -- the open visit is one of them and grows
       // as you walk -- rather than covering them with an overlay of one.
@@ -4009,6 +5386,10 @@ async function refreshLiveInside(mapStr) {
       }
       return;
     }
+    peekOffer(true);
+    // Looking at the world on purpose. The five-second refresh would put the
+    // cave straight back up, which would read as the button not working.
+    if (state.peek) return;
     // Every run through this place, the way hovering its marker shows them.
     // Only the open one used to be drawn, so walking back into a cave you
     // knew well showed a single fresh line and nothing you had done before.
@@ -4026,6 +5407,7 @@ async function refreshLiveInside(mapStr) {
   // walked into, so there is no entrance to hang it on. The inset is the
   // fallback -- without it the map just sits there while you play, which
   // looks like the recorder has stopped.
+  peekOffer(false);
   const homeless = newest(data.unplaced || []);
   if (homeless && seq === refreshes.insideLive) openInterior(homeless);
 }
@@ -4055,15 +5437,24 @@ async function buildStats() {
     ['Inside dungeons', km(d.inside_m)],
     // Gaps longer than ten seconds are the game paused or the map open, so
     // this is time played rather than time the recorder was left running.
-    ['Time recorded', spell(d.active_ms)],
+    ['Time spent tracking', spell(d.active_ms)],
+    // How much of that you were actually going somewhere. Nothing is stored
+    // until you have moved, so a gap always ends in a step -- what it cannot
+    // say by itself is whether you walked through the whole of it. The ground
+    // covered says: the time that distance takes at walking pace, never more
+    // than the gap it happened in. On routes.db it is 13.1 h of 19.4.
+    ['Active playtime', spell(d.moving_ms)],
     ['Average session', spell(d.session_mean_ms)],
     ['Longest session', spell(d.session_max_ms)],
+    // With the two session lengths, not three rows below them: how many
+    // there were and how long they ran are one question asked three ways.
+    ['Sessions', `${d.sessions}`],
     ['Deaths', `${d.deaths}`],
     ['Deaths an hour', d.deaths_per_hour === null ? '-' : `${d.deaths_per_hour}`],
     ['Teleports', `${d.jumps}`],
+    // `d.legacy` is still sent and still counted; it is not shown, because
+    // four castles beside twenty-five caves was a number nobody was reading.
     ['Caves and dungeons', `${d.dungeons}`],
-    ['Legacy dungeons', `${d.legacy}`],
-    ['Sessions', `${d.sessions}`],
   ];
   // Only once there is any: with nothing recorded down there a nought reads
   // as a broken reading rather than as somewhere you have not been.
@@ -4097,18 +5488,30 @@ function buildSessions() {
   const shown = newest.slice(0, state.shownSessions);
   for (const s of shown) box.appendChild(sessionRow(s));
 
-  const more = document.getElementById('more-sessions');
+  // Two buttons rather than one that changes its mind. The single button
+  // said "Show fewer" only once every session was on screen, so opening a
+  // hundred rows to look at one was a thing you could not undo until you had
+  // opened all of them.
+  const more = control('more-sessions');
+  const fewer = control('fewer-sessions');
   const rest = newest.length - shown.length;
-  more.hidden = rest <= 0 && state.shownSessions <= 6;
-  more.textContent = rest > 0
-    ? `Show ${Math.min(rest, 20)} more (${rest} hidden)`
-    : 'Show fewer';
+  more.hidden = rest <= 0;
+  if (rest > 0) more.textContent = `Show ${Math.min(rest, 20)} more (${rest} hidden)`;
+  fewer.hidden = state.shownSessions <= SESSIONS_SHOWN;
+  fewer.textContent = 'Show fewer';
   if (!more.dataset.wired) {
     more.dataset.wired = '1';
     more.addEventListener('click', () => {
-      const all2 = (state.meta.sessions || []).length;
-      state.shownSessions = state.shownSessions >= all2 ? 6
-        : state.shownSessions + 20;
+      state.shownSessions = Math.min(
+        (state.meta.sessions || []).length, state.shownSessions + 20);
+      buildSessions();
+    });
+    fewer.addEventListener('click', () => {
+      // Down the same step it went up, and never past the default: the same
+      // number of presses back as it took to get here.
+      state.shownSessions = Math.max(
+        SESSIONS_SHOWN,
+        Math.min(state.shownSessions, newest.length) - 20);
       buildSessions();
     });
   }
@@ -4125,6 +5528,14 @@ function buildSessions() {
       scheduleReload();
     });
   }
+}
+
+// The same capped clock the Statistics panel totals, written short enough
+// to sit at the end of a row: "1 h 12" rather than "1 h 12 min".
+function playedFor(ms) {
+  const mins = Math.round(ms / 60000);
+  if (mins < 60) return `${mins} min`;
+  return `${Math.floor(mins / 60)} h ${String(mins % 60).padStart(2, '0')}`;
 }
 
 function sessionRow(s) {
@@ -4148,8 +5559,23 @@ function sessionRow(s) {
   text.textContent = /sim/i.test(s.note || '') ? `${when} (sim)` : when;
   if (s.note) label.title = s.note;
   const count = document.createElement('span');
-  count.textContent = s.samples.toLocaleString();
+  // How long you played, not how many points it stored. The point count is a
+  // fact about the sampling rate as much as about the session -- an hour at
+  // five seconds a sample and three minutes at four a second are the same
+  // number -- and it is still what the delete confirmation asks about,
+  // because that is what deleting removes.
+  count.textContent = s.active_ms ? playedFor(s.active_ms) : '\u2013';
+  count.title = `${s.samples.toLocaleString()} points`;
   label.append(cb, text, count);
+
+  // Play this one back. The playback's axis is the whole route, so a
+  // session is a window on it and this is the two grips plus repeat.
+  const one = document.createElement('button');
+  one.className = 'ghost play-one';
+  one.textContent = '\u25B6\uFE0E';
+  one.title = 'Play this session back';
+  one.setAttribute('aria-label', `Play back the session from ${when}`);
+  one.addEventListener('click', () => playSession(s));
 
   const del = document.createElement('button');
   del.className = 'ghost del';
@@ -4158,8 +5584,57 @@ function sessionRow(s) {
   del.setAttribute('aria-label', `Delete the session from ${when}`);
   del.addEventListener('click', () => confirmDelete(row, s));
 
-  row.append(label, del);
+  row.append(label, one, del);
   return row;
+}
+
+// One session, played back on its own.
+//
+// Nothing new drives this: the playback already runs between two grips,
+// and a session is a window on the same axis. So the button enters the
+// playback if it is not already in it, puts the grips on that session's
+// own span, and turns repeat on -- one session is a thing you watch round
+// again rather than a route that ends.
+//
+// The two filters it has to reckon with are the ones playWorld() asks the
+// server for. A session that is not ticked is not in the playback either,
+// so it is ticked first: pressing play on it says plainly enough that you
+// want to see it. The time window is left alone -- widening it silently
+// would change what the whole map means -- so a session outside it is
+// reported rather than played, which is also what happens to a session
+// with nothing drawn from it at all.
+async function playSession(s) {
+  if (state.sessions.size && !state.sessions.has(s.id)) {
+    state.sessions.add(s.id);
+    const box = document.querySelector(
+      `#sessions input[data-session="${s.id}"]`);
+    if (box) box.checked = true;
+    await reload();
+  }
+  if (!play.on) {
+    await enterPlayback();
+    if (!play.on) return;          // nothing drawn, or a later press won
+  }
+  const from = playElapsedFor(s.started_ms);
+  const until = s.ended_ms ? playElapsedFor(s.ended_ms) : play.to;
+  // Both ends land on the same point when the session is not on the axis:
+  // outside the time window, or a session that stored nothing.
+  if (!(until > from)) {
+    setStats(state.range
+      ? 'That session is outside the time window.'
+      : 'Nothing of that session is drawn.');
+    return;
+  }
+  play.from = from;
+  play.until = until;
+  playTrimUI();
+  if (!play.loop) {
+    play.loop = true;
+    savePref('loop', true);
+    playRepeatUI();
+  }
+  playSeek(play.from);
+  playResume();
 }
 
 function confirmDelete(row, s) {
@@ -4209,10 +5684,120 @@ async function refreshSessions() {
   await loadInteriors();
 }
 
+// Every section in the panel folds away, and the heading is the control.
+// A real tab stop and a real role, because it behaves like a button whatever
+// element it is written as -- and remembered per section, since which parts
+// of a panel this long you want standing is a preference like the rest.
+function wireSections() {
+  for (const sec of document.querySelectorAll('#panel > section')) {
+    const h = sec.querySelector(':scope > h2');
+    if (!h || !sec.id) continue;
+    const key = `sec.${sec.id}`;
+    if (pref(key) === 'false') sec.classList.add('shut');
+    h.tabIndex = 0;
+    h.setAttribute('role', 'button');
+    const say = () => h.setAttribute(
+      'aria-expanded', String(!sec.classList.contains('shut')));
+    say();
+    const flip = () => {
+      sec.classList.toggle('shut');
+      savePref(key, !sec.classList.contains('shut'));
+      say();
+    };
+    h.addEventListener('click', flip);
+    h.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); flip(); }
+    });
+  }
+}
+
+// The filled part of a slider. A range styled with `appearance: none` is
+// drawn by nobody, so Chrome paints no progress: the value reaches CSS as
+// a custom property instead. Firefox has ::-moz-range-progress and ignores
+// this. Only the bars in the panel and the speed on the timeline are
+// styled that way -- the brightness, the time window and the scrub each
+// draw their own track.
+const RANGE_BARS = '.slider input[type=range], #play-speed';
+
+function paintRange(el) {
+  const lo = +el.min || 0;
+  const hi = el.max === '' ? 100 : +el.max;
+  const at = hi === lo ? 0 : ((+el.value - lo) / (hi - lo)) * 100;
+  el.style.setProperty('--fill', `${at}%`);
+}
+
+// Every one of them, for the moments a value is set rather than dragged:
+// a preference restored at boot, or the align sliders going back to zero.
+function paintRanges() {
+  for (const el of document.querySelectorAll(RANGE_BARS)) paintRange(el);
+}
+
+// The colour-by control. A <select> is drawn by the browser in the
+// browser's own colours, and leaves a focus ring standing on the closed
+// control until you click somewhere else -- so this is a button and a
+// panel. It carries a `value` and fires `input` and `change` like the
+// select it replaces, which is why nothing that reads it had to change:
+// the look map in wireControls() sets and reads `.value`, and wireInset()
+// listens for `change`.
+function wirePicker() {
+  const el = control('tint-mode');
+  if (!el.querySelector) return;                 // an older page
+  const list = el.querySelector('.picker-list');
+  const btn = el.querySelector('.picker-btn');
+  const now = el.querySelector('.now');
+  const opts = [...el.querySelectorAll('.picker-list button')];
+  const shut = () => {
+    el.classList.remove('open');
+    list.hidden = true;
+    btn.setAttribute('aria-expanded', 'false');
+  };
+  Object.defineProperty(el, 'value', {
+    get: () => el.dataset.value,
+    set: (v) => {
+      const opt = opts.find((o) => o.dataset.value === v) || opts[0];
+      el.dataset.value = opt.dataset.value;
+      now.textContent = opt.dataset.label;
+      for (const o of opts) o.classList.toggle('on', o === opt);
+    },
+  });
+  el.value = el.dataset.value;                   // paint the initial choice
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const open = !el.classList.contains('open');
+    el.classList.toggle('open', open);
+    list.hidden = !open;
+    btn.setAttribute('aria-expanded', String(open));
+  });
+  for (const o of opts) {
+    o.addEventListener('click', () => {
+      el.value = o.dataset.value;
+      shut();
+      // What everything downstream is listening for. `input` is what the
+      // look map uses and `change` is what the inset uses, so both.
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+  }
+  document.addEventListener('click', shut);
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') shut();
+  });
+}
+
 function wireControls() {
+  wireSections();
+  wirePicker();
+  control('peek').addEventListener('click', () => setPeek(!state.peek));
+  // The marks live in two places -- their own layer group, and drawn onto
+  // the legacy dungeons' permanent paths -- so refetching the list is only
+  // half of a toggle. Without the redraw, unticking Deaths cleared the 61 on
+  // the world and left 20 sitting on the castles, and unticking Teleports
+  // left 8. Measured on routes.db, both ways.
+  const redrawMarks = (fetchList) => fetchList().then(() => loadInteriors());
+
   rememberToggle('l-deaths', 'deaths', (on, first) => {
     state.deaths = on;
-    if (!first) loadDeaths();
+    if (!first) redrawMarks(loadDeaths);
   });
 
   const followCheck = control('l-follow');
@@ -4228,14 +5813,17 @@ function wireControls() {
     showFollowBox();
   });
 
+  // Only ever consulted while following, so it lives with the follow.
+  rememberToggle('l-hold-spot', 'holdSpot', (on) => { state.holdSpot = on; });
+
   rememberToggle('l-respawns', 'respawns', (on, first) => {
     state.respawns = on;
-    if (!first) loadDeaths();
+    if (!first) redrawMarks(loadDeaths);
   });
 
   rememberToggle('l-warps', 'warps', (on, first) => {
     state.warps = on;
-    if (!first) loadWarps();
+    if (!first) redrawMarks(loadWarps);
   });
 
   // A pinned dungeon stays until you dismiss it -- unless a click is being
@@ -4251,7 +5839,10 @@ function wireControls() {
     if (play.on) { playGoToHover(); return; }
     hideInside(true);
   });
-  map.on('mousemove', (e) => { if (play.on) playHover(e.latlng); });
+  map.on('mousemove', (e) => {
+    if (play.on) { playHover(e.latlng); return; }
+    insideHover(e.latlng);
+  });
   map.on('mouseout', () => playHover(null));
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
@@ -4298,16 +5889,26 @@ function wireControls() {
     'line-weight': ['weight', (el) => +el.value],
     'line-casing': ['casing', (el) => +el.value],
     'line-colour': ['colour', (el) => el.value],
-    'age-depth': ['ageDepth', (el) => +el.value],
+    // Backwards against the ladder, on purpose. AGE_DEPTHS runs widest first,
+    // so the index and the slider disagree about which way is "more" -- and
+    // the slider is the one you look at: dragging right should reach further
+    // back, not less far. The index keeps its meaning, so `route.ageDepth`
+    // holds what it always held and a setting saved before this still means
+    // the same window; it is the control that is reversed, not the value.
+    'age-depth': ['ageDepth', (el) => AGE_DEPTHS.length - 1 - +el.value,
+                  (v) => String(AGE_DEPTHS.length - 1 - +v)],
   };
-  for (const [id, [key, read]] of Object.entries(look)) {
+  for (const [id, [key, read, write]] of Object.entries(look)) {
     const el = control(id);
     const saved = localStorage.getItem(`route.${key}`);
-    if (saved !== null) el.value = saved;
+    if (saved !== null) el.value = write ? write(saved) : saved;
     state[key] = read(el);
     el.addEventListener('input', () => {
       state[key] = read(el);
-      try { localStorage.setItem(`route.${key}`, el.value); } catch (e) { /* private mode */ }
+      // The state and not the control: for a reversed slider those are two
+      // different numbers, and the one worth keeping is the one that means
+      // something on its own.
+      try { localStorage.setItem(`route.${key}`, state[key]); } catch (e) { /* private mode */ }
       syncPathRows();
       redrawEverything();
     });
@@ -4341,7 +5942,23 @@ function wireControls() {
       map.panInside(youMark.getLatLng(), { padding: effectivePad() });
     }
   });
+  // While the cursor is on the slider, and not a moment longer. A timer meant
+  // a flick past the control left the box standing for a second and a half,
+  // and holding the cursor still on the control made it go away -- both of
+  // them saying something about a timer rather than about where you are
+  // pointing. The drag is the one thing that outlives the pointer leaving:
+  // dragging a slider takes the cursor off it constantly.
   pad.addEventListener('pointerenter', showFollowBox);
+  pad.addEventListener('pointerleave', () => { if (!padHeld) hideFollowBox(); });
+  pad.addEventListener('pointerdown', () => { padHeld = true; showFollowBox(); });
+  window.addEventListener('pointerup', () => {
+    if (!padHeld) return;
+    padHeld = false;
+    if (!pad.matches(':hover')) hideFollowBox();
+  });
+  // Keyboard: the arrows move it with no pointer anywhere near.
+  pad.addEventListener('focus', showFollowBox);
+  pad.addEventListener('blur', () => { if (!pad.matches(':hover')) hideFollowBox(); });
 
   // Darkening the terrain: the map is a painting, and a route drawn over the
   // busiest parts of it needs the painting turned down rather than the line
@@ -4391,7 +6008,13 @@ function wireControls() {
       Math.round((step / 100) * (q.length - 1))))];
   }
 
-  function applyRange() {
+  // `first` is the call that only sets the label up at boot. Without it
+  // wiring the panel queued a full reload 250 ms in -- the route and all
+  // three mark lists, fetched again a moment after boot had just fetched
+  // them. At a tenth of a second a call that is invisible; measured on a
+  // database ten times the size of routes.db it was 4.6 s of the 8 before
+  // the map settled.
+  function applyRange(first) {
     let a = +from.value, c = +to.value;
     if (a > c) { [a, c] = [c, a]; }
     fill.style.left = `${a}%`;
@@ -4405,15 +6028,21 @@ function wireControls() {
     label.textContent = state.range
       ? `${when(t0)} to ${when(t1)}`
       : 'Everything recorded';
-    scheduleReload();
+    if (!first) scheduleReload();
   }
 
-  from.addEventListener('input', applyRange);
-  to.addEventListener('input', applyRange);
+  // Bound rather than passed straight to addEventListener, which would hand
+  // the event object in as `first` and make every drag of the slider the
+  // silent one.
+  from.addEventListener('input', () => applyRange());
+  to.addEventListener('input', () => applyRange());
   control('reset-time').addEventListener('click', () => {
     from.value = 0; to.value = 100; applyRange();
   });
-  applyRange();
+  applyRange(true);
+
+  // Last, so every preference restored above is on its slider by now.
+  paintRanges();
 }
 
 async function redrawEverything() {
@@ -4465,13 +6094,20 @@ function effectivePad() {
   return [reach(size.x), reach(size.y)];
 }
 
+// Whether the edge-margin slider is being dragged. A drag takes the cursor
+// off the control almost immediately, so the pointer leaving is not the same
+// question as the drag being over.
+let padHeld = false;
+
 function showFollowBox() {
   if (!followBox) return;
   const [px, py] = effectivePad();
   followBox.style.inset = `${py}px ${px}px`;
   followBox.classList.add('show');
-  clearTimeout(followBoxTimer);
-  followBoxTimer = setTimeout(() => followBox.classList.remove('show'), 1400);
+}
+
+function hideFollowBox() {
+  if (followBox) followBox.classList.remove('show');
 }
 
 function applyDim() {
@@ -4712,6 +6348,7 @@ function alignReset() {
   for (const id of ['a-scale', 'a-scaley', 'a-x', 'a-y']) {
     document.getElementById(id).value = 0;
   }
+  paintRanges();
   alignDraw();
   map.fitBounds(state.imageBounds, { padding: [10, 10] });
 }
