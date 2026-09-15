@@ -52,6 +52,17 @@ class Sampler:
         self.interval = float(rec.get("interval_s", 0.25))
         self.min_move = float(rec.get("min_move_m", 1.5))
         self.max_speed = float(rec.get("max_speed_mps", 40.0))
+        # Inside a dungeon the ceiling is much lower, and it has to be. 40 m/s
+        # is right on the surface, where a quarter-second interval turns small
+        # position noise into large implied speeds and Torrent gallops at 15.9
+        # -- but nothing in a cave moves like that, and a teleporter with a
+        # six-second animation implies only about 27. Measured over the 19,835
+        # unbroken interior steps in routes.db: one at 26.9 m/s, which is the
+        # teleporter out of m31_04 that this exists to catch, one at 11.0, and
+        # nothing at all in between. `repair_jumps.py` has used 15 for exactly
+        # this since it was written; the recorder was still using the surface
+        # number and drew that jump as a walked line through the rock.
+        self.max_speed_inside = float(rec.get("max_speed_inside_mps", 15.0))
         self.idle_flush_s = float(rec.get("idle_flush_s", 5.0))
         # How many reads in a row may fail before whatever comes back counts
         # as somewhere you were put. Counted in reads rather than seconds
@@ -90,6 +101,16 @@ class Sampler:
         # map menu cannot be read at all. Only the second one means you were
         # not being watched.
         self.blind = 0
+        # The last reading, stored or not. The speed check is measured against
+        # this rather than against the last stored sample: the movement gate
+        # keeps nothing while you stand still, and a teleport taken from a
+        # standstill was being divided by however long you had stood there.
+        self.last_read: dict | None = None
+        # Underground maps whose own way in says they are drawn somewhere
+        # they are not. Remembered for the session rather than decided per
+        # reading: the measurement exists only on the step across, and
+        # every reading after it would go on being drawn 4 km away.
+        self.adrift: set[int] = set()
         self._pending = 0
         self._last_commit = time.time()
         self.counts = {"samples": 0, "breaks": 0, "events": 0, "skipped": 0,
@@ -146,21 +167,58 @@ class Sampler:
 
         # It is placed. Does the way you came in agree with where it is drawn?
         off = math.dist(implied, (world[0] - r.x, world[1] - r.z))
-        if off > self.ORIGIN_TOLERANCE_M and self._say_once(r.map_id, "adrift"):
+        if off <= self.ORIGIN_TOLERANCE_M:
+            return
+        # Saying so in the console and drawing it anyway is the worst of
+        # both: the console is not what anybody is looking at, and the map
+        # put a walk under Liurnia four kilometres away in the middle of
+        # the sea. A map with no origin is already kept off the map rather
+        # than drawn somewhere invented, and a map placed where it
+        # demonstrably is not is that same case with a number on it.
+        self.adrift.add(r.map_id)
+        if self._say_once(r.map_id, "adrift"):
             print(
                 f"\n  {m} is drawn {off:.0f} m from where walking into it "
-                f"says it is, so it does not share its area's frame. Give it "
-                f"its own entry:\n"
+                f"says it is, so it does not share its area's frame. Its "
+                f"path is recorded but not drawn until it has one:\n"
                 f"    [maps.map_origin]\n"
                 f'    "{m}" = [{implied[0]:.2f}, {implied[1]:.2f}]\n'
+                f"  Add that under [maps] in config.toml and restart, "
+                f"then tools/repair_underground.py --write re-files what "
+                f"is already recorded.\n"
             )
 
-    def _speed(self, wx: float, wz: float, ts: int) -> float:
-        p = self.prev
-        if not p or p.get("wx") is None:
-            return 0.0
-        dt = max((ts - p["ts"]) / 1000.0, 1e-3)
-        return math.dist((wx, wz), (p["wx"], p["wz"])) / dt
+    def _moved(self, seen: dict | None, x: float, z: float,
+               wx: float | None, wz: float | None,
+               map_id: int, ts: int) -> tuple[float, float] | None:
+        """How far the last reading is from this one, and how long ago.
+
+        The previous *reading*, not the previous stored sample. The
+        movement gate stores nothing while you stand still, so a
+        transporter taken from a standstill was measured across the whole
+        time you stood there: 45 m in 7 s inside a catacomb on
+        2026-09-13, which is 6.4 m/s -- walking pace, under every ceiling
+        there is, and the line was drawn through the rock.
+
+        Flat. Height is left out for the same reason the movement gate
+        leaves it out: a lift is a hundred metres of nothing you walked,
+        and counting it would call every one of them a teleport.
+
+        The two coordinate spaces are kept apart the way everything else
+        here keeps them apart: world metres when both readings have a
+        world position, the map's own metres when neither does and the
+        map has not changed, and no answer at all across the boundary --
+        where a load screen or the map-change rule speaks instead.
+        """
+        if not seen:
+            return None
+        dt = max((ts - seen["ts"]) / 1000.0, 1e-3)
+        if wx is not None and seen.get("wx") is not None:
+            return math.dist((wx, wz), (seen["wx"], seen["wz"])), dt
+        if (wx is None and seen.get("wx") is None
+                and seen.get("map_id") == map_id):
+            return math.dist((x, z), (seen["x"], seen["z"])), dt
+        return None
 
     def step(self) -> None:
         self._step()
@@ -215,8 +273,9 @@ class Sampler:
         # it does not depend on the game reporting anything: if the recorder
         # could not see you, it cannot claim you walked.
         if self.blind >= self.blind_reads:
+            # Counted where the break is written, not here as well: this
+            # said two reloads for one load screen.
             self.reloaded = True
-            self.counts["reloads"] += 1
         self.blind = 0
 
         # And the most reliable signal of all is HP, where there is any. The
@@ -292,6 +351,8 @@ class Sampler:
         # a check that the map really does share the frame.
         if layer == UNDERGROUND and map_changed:
             self._check_origin(m, r, world)
+        if r.map_id in self.adrift:
+            world = None
 
         # Interiors have their own local axes; recording their raw coordinates
         # on the world plane is exactly the bug that draws cave crawling as an
@@ -302,6 +363,14 @@ class Sampler:
             wx, wz = world
             if layer == SURFACE:
                 self.last_surface = (wx, wz)
+
+        # The reading, kept whether or not it is about to be stored: the
+        # speed check below is measured against it. Taken here rather than
+        # at the top because it wants the world position, and dropped into
+        # a local first because the check needs the one before this.
+        seen = self.last_read
+        self.last_read = {"ts": ts, "map_id": r.map_id,
+                          "x": r.x, "z": r.z, "wx": wx, "wz": wz}
 
         # Death, before the movement gate: you usually die standing still, or
         # close enough, and the gate would drop the reading that carries it.
@@ -350,20 +419,33 @@ class Sampler:
                     self.counts["skipped"] += 1
                     return
 
-        if wx is not None:
-            speed = self._speed(wx, wz, ts)
-        elif (self.prev and not map_changed
-                and self.prev.get("wx") is None):
-            # Inside a dungeon there is no world position, but the local
-            # coordinates are metres too: a lift or a teleporter in there
-            # moves you further than anything can walk, and without this the
-            # line was drawn straight through the rock.
-            dt = max((ts - self.prev["ts"]) / 1000.0, 1e-3)
-            speed = math.dist(
-                (r.x, r.z), (self.prev["lx"], self.prev["lz"])
-            ) / dt
-        else:
-            speed = 0.0
+        # Did you cover more ground than you could have?
+        #
+        # A distance, not a speed, though the two are the same statement:
+        # how far the fastest thing that moves could have carried you
+        # since the last reading, plus the slack the movement gate itself
+        # allows, because a stored step can always be `min_move_m` longer
+        # than the walking in it. Measured over every step stored one
+        # reading apart, flat, with the five-second imports left out:
+        #
+        #                     0.25 s poll   0.5 s poll   allowance
+        #   inside a dungeon      2.27 m       5.50 m     4.25 / 9.00 m
+        #   on the surface        3.92 m       7.30 m    11.50 / 21.50 m
+        #
+        # against a smallest real jump inside of 10.4 m. Stating it as a
+        # distance is what makes those numbers checkable; stating the
+        # allowance as a speed times the interval is what keeps one
+        # threshold honest across every poll rate, from a quarter of a
+        # second to the five of an imported route.
+        #
+        # Inside there is no world position, but the local coordinates
+        # are metres too: a lift or a teleporter in there moves you
+        # further than anything can walk, and without this the line was
+        # drawn straight through the rock.
+        top = self.max_speed if wx is not None else self.max_speed_inside
+        moved = self._moved(seen, r.x, r.z, wx, wz, r.map_id, ts)
+        too_far = (moved is not None
+                   and moved[0] > self.min_move + top * moved[1])
         # A map change means a teleport only when the two maps are not tiles
         # of the same world. Crossing an overworld tile boundary is walking,
         # and the speed check still catches a warp between two tiles.
@@ -377,7 +459,7 @@ class Sampler:
             break_before = BREAK_RELOAD
             self.counts["reloads"] += 1
             self.reloaded = False
-        elif speed > self.max_speed:
+        elif too_far:
             break_before = BREAK_SPEED
         elif map_changed and not crossed_tile:
             break_before = BREAK_MAP
@@ -415,15 +497,25 @@ class Sampler:
                     "session_id": self.session_id,
                 }
             )
-        self.prev = {"ts": ts, "wx": wx, "wz": wz, "lx": r.x, "lz": r.z}
+        # y is kept for finish(), which has to classify the map you were
+        # last on and cannot ask the source again once it has gone.
+        self.prev = {"ts": ts, "wx": wx, "wz": wz, "lx": r.x, "lz": r.z,
+                     "y": r.y}
 
     def finish(self) -> None:
         if self.current_map is not None:
+            # The layer of the map you were actually on. Hardcoding INTERIOR
+            # here wrote 28 leave events in routes.db claiming a Lands
+            # Between tile was the inside of something -- harmless only
+            # because nothing reads a leave event's layer, which is not a
+            # thing to rely on.
+            last = MapId.unpack(self.current_map)
             self.store.add_map_event(
                 session_id=self.session_id,
                 ts_ms=self.clock(),
                 map_id=self.current_map,
-                layer=INTERIOR,
+                layer=self.maps.classify(
+                    last, self.prev.get("y", 0.0) if self.prev else 0.0),
                 kind="leave",
                 anchor_wx=self.last_surface[0] if self.last_surface else None,
                 anchor_wz=self.last_surface[1] if self.last_surface else None,

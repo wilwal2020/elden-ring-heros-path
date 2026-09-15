@@ -716,6 +716,66 @@ def main() -> int:
           f"{sum(1 for r in inside_rows if r['break_before'] == BREAK_SPEED)} speed breaks")
     tele2.close()
 
+    # And the same teleporter taken from a standstill, which is how a
+    # transporter chest is taken: you stop, you open it, and the animation
+    # holds you still for several seconds. Reported from the field on
+    # 2026-09-15 -- "I just took a transporter chest in a cave, and it drew a
+    # path instead of making it a teleport" -- and the recording says why:
+    # 45.2 m in 7.01 s inside m30_13, which is 6.4 m/s, walking pace, under
+    # every ceiling there is.
+    #
+    # The speed was measured against the last sample the movement gate had
+    # let through, and the gate lets nothing through while you stand still.
+    # So the denominator was however long you had been standing, and the
+    # longer you waited the more walkable the jump looked. Against the
+    # reading half a second before it, it is 90 m/s.
+    chest_db = ROOT / "data" / "selftest_chest.db"
+    for suffix in ("", "-wal", "-shm"):
+        q = Path(str(chest_db) + suffix)
+        if q.exists():
+            q.unlink()
+    chest = Store(chest_db)
+    chest.start_session("a transporter chest inside a cave")
+    src_chest = Scripted(
+        walk(surface, [5.0, 9.0], y=80.0, z=5.0)
+        + walk(cave, [10.0, 12.0, 14.0])       # walked in
+        # Standing at the chest: the readings keep coming and the gate keeps
+        # dropping them, because nothing has moved 1.5 m.
+        + walk(cave, [14.2, 14.1, 14.2, 14.1, 14.2, 14.1, 14.2, 14.1])
+        + walk(cave, [59.0, 60.0])             # and then 45 m in one reading
+    )
+    clock_chest = [1_700_000_000_000]
+    chest_s = Sampler(src_chest, chest, cfg, clock=lambda: clock_chest[0])
+    for _ in range(15):
+        clock_chest[0] += 500              # the recorder's own half-second
+        chest_s.step()
+    chest_s.finish()
+    chest.commit()
+    chest_rows = [r for r in chest.db.execute(
+        "SELECT break_before, x, ts_ms FROM samples WHERE wx IS NULL ORDER BY id")]
+    landed = [r for r in chest_rows if r["x"] > 50]
+    check("a teleport taken from a standstill is still a teleport",
+          landed and landed[0]["break_before"] == BREAK_SPEED,
+          f"break {landed[0]['break_before'] if landed else 'nothing stored'} "
+          f"on the arrival")
+    # The gate is what hid it: seven seconds of stored nothing before the
+    # jump, so measuring from the last stored sample gave walking pace.
+    if landed:
+        before = [r for r in chest_rows if r["ts_ms"] < landed[0]["ts_ms"]]
+        held = (landed[0]["ts_ms"] - before[-1]["ts_ms"]) / 1000 if before else 0
+        check("and the standstill it was taken from is what hid it",
+              held >= 4.0,
+              f"{held:.1f} s between the last stored sample and the arrival")
+    # A mark for it, too: 45 m is under the 50 m floor that tells a tile
+    # crossing from a warp, and that floor has nothing to say about a speed
+    # break -- the recorder has already measured something unwalkable.
+    chest_warps = [w for w in chest.warps() if w["break_before"] == BREAK_SPEED]
+    check("and it is drawn as one rather than dropped for being short",
+          len(chest_warps) == 1 and 40 < chest_warps[0]["distance_m"] < 50,
+          f"{len(chest_warps)} speed jump(s)"
+          + (f" of {chest_warps[0]['distance_m']:.1f} m" if chest_warps else ""))
+    chest.close()
+
     tele_visits = [v for v in tele_store.interior_visits()
                    if v["map_id"] == tower]
     anchors = {(round(v["wx"], 3), round(v["wz"], 3)) for v in tele_visits}
@@ -1037,10 +1097,21 @@ def main() -> int:
           and 'if w.get("from_inside") and w.get("from_x") is not None:' in srv
           and '"from_map_id"' in srv)
     page = (ROOT / "viewer" / "app.js").read_text(encoding="utf-8")
+    # Every call that marks a jump as a death has to carry the departure --
+    # a transit's is not the row before its arrival. Counted by looking at
+    # each call site rather than by counting the substring, which went red
+    # the day one of them stopped being written out twice.
+    marking = []
+    for name in ("callDeath({ ts:", "playReclassify({ ts:"):
+        at = page.find(name)
+        while at != -1:
+            marking.append(page[at:at + 90])
+            at = page.find(name, at + 1)
+    jumps = [c for c in marking
+             if "clear: true" not in c and "at: true" not in c]
     check("and every 'This was a death' sends the jump, not just its end",
-          page.count("from_ts:") >= 5
-          and "callDeath({ ts: jump.ts, from_ts: jump.from_ts })" in page,
-          f"{page.count('from_ts:')} call sites carry it")
+          len(jumps) >= 3 and all("from_ts:" in c for c in jumps),
+          f"{len(jumps)} of {len(marking)} call sites mark a jump")
 
     dead_store.close()
     for suffix in ("", "-wal", "-shm"):
@@ -1294,6 +1365,51 @@ def main() -> int:
     check("but it does take one from its own",
           same["respawn"] is not None and round(same["respawn"]["wx"]) == 30,
           f'{same["respawn"]["after_s"]}s later' if same["respawn"] else "none")
+
+    # And where the rule is wrong, it can be told. The grace is the first
+    # load screen after the death, which is right almost always and cannot be
+    # right every time: reported from the field, a death at 17:27:06 whose
+    # next load screen at 17:27:21 is still in the room it happened in, with
+    # the place the game actually put the player at 17:27:26 carrying a map
+    # change -- which respawn_after() refuses on purpose, so no tuning of it
+    # reaches that reading. Measured on the live database: of 282 deaths with
+    # a grace, 150 have a second candidate in the window, so there is no
+    # counting rule to be had either.
+    #
+    # The fixture is that shape: the rule's answer, and one sample further on
+    # that it would never pick.
+    gh.add_sample(session_id=gid, ts_ms=t + 917_000, map_id=surf,
+                  layer="surface", x=0.0, y=88.0, z=0.0,
+                  wx=555.0, wz=666.0, break_before=1)
+    gh.commit()
+    moved = gh.step_grace(t + 900_000, 1)
+    stepped = [d for d in gh.deaths() if d["ts_ms"] == t + 900_000][0]
+    check("a grace the recording cannot place can be moved along by hand",
+          moved and stepped["respawn"] is not None
+          and round(stepped["respawn"]["wx"]) == 555,
+          f'at {stepped["respawn"]["wx"] if stepped["respawn"] else None}')
+    # On the death, not on the sample: the break the rule reads is the game's
+    # word and not ours to move, which is the same reasoning that gave
+    # `death_by_hand` a kind of its own rather than a flag.
+    kept = gh.db.execute(
+        "SELECT grace_step FROM map_events WHERE ts_ms = ? AND kind = 'death'",
+        (t + 900_000,)).fetchone()
+    broke = gh.db.execute(
+        "SELECT break_before FROM samples WHERE ts_ms = ?",
+        (t + 917_000,)).fetchone()
+    check("and the answer is kept on the death, leaving the samples alone",
+          kept and kept["grace_step"] == 1 and broke["break_before"] == 1)
+    gh.step_grace(t + 900_000, 0)
+    back = [d for d in gh.deaths() if d["ts_ms"] == t + 900_000][0]
+    check("and putting it back gives the rule's own answer again",
+          back["respawn"] is not None and round(back["respawn"]["wx"]) == 30)
+    # Off the end of the session is not an answer: the mark stays where the
+    # rule put it rather than disappearing.
+    gh.step_grace(t + 900_000, 99)
+    far = [d for d in gh.deaths() if d["ts_ms"] == t + 900_000][0]
+    check("and stepping past the end of the recording changes nothing",
+          far["respawn"] is not None and round(far["respawn"]["wx"]) == 30)
+    gh.step_grace(t + 900_000, 0)
 
     # Almost every read here asks for one layer over a slice of time, and
     # with separate indexes on each SQLite took the layer one -- every
@@ -2594,8 +2710,11 @@ def main() -> int:
         check("and a redraw ends it rather than leaving it on a stale path",
               "if (play.on) exitPlayback();" in page)
         check("the viewer draws them, on the map and inside dungeons",
-              "'respawn-mark'" in page and "respawnsInside" in page
-              and "addRespawnMark" in page)
+              "respawnsInside" in page
+              and "function respawnPopup(" in page
+              and "function insideRespawnPopup(" in page
+              and "{ cls: 'respawn', glyph: '\\u2739' }" in page
+              and "cls: 'respawn', glyph: '\\u2739'," in page)
 
         st_, dths = await get("/api/deaths")
         check("GET /api/deaths", st_ == 200 and len(dths["deaths"]) > 0,
@@ -2647,42 +2766,151 @@ def main() -> int:
         bad_status = await asyncio.to_thread(_status, "/api/interior")
         check("interior path needs its visit's handle", bad_status == 400)
 
-        # Some dungeons cannot be located from a route at all, so the last
-        # word is the user's: a place set by hand outranks everything worked
-        # out from the recording, and applies to every visit to that map.
-        v0 = ints["visits"][0]
+        # Where a route can measure a place, the measurement wins -- and where
+        # it cannot, the last word is the user's.
+        #
+        # A hand placement is somebody's best guess at where a doorway is. The
+        # `entrance` and `exit` tiers are not guesses: they are the surface
+        # position recorded on the step across the threshold. So a drag is
+        # what stands in until something walks through a door, and retires the
+        # moment one does. Reported from the field on Leyndell, placed by hand
+        # from a teleport in when nothing had ever walked its front gate: the
+        # day something did, the drag was 520 m from the door the recorder had
+        # just measured, and the castle was drawn there.
+        walked = next((v for v in store.interior_visits()
+                       if v["placed"] == "entrance"), None)
+        check("the fixture has a dungeon somebody walked into", walked is not None)
         st_, put = await post("/api/place",
-                              {"map_id": v0["map_id"], "wx": 1234.0, "wz": 5678.0})
+                              {"map_id": walked["map_id"], "wx": 1234.0, "wz": 5678.0})
         check("POST /api/place records where a dungeon is", st_ == 200 and put["ok"])
-        moved = [x for x in store.interior_visits() if x["map_id"] == v0["map_id"]]
-        check("a place set by hand wins over anything inferred",
-              moved and all(x["placed"] == "by hand" and abs(x["wx"] - 1234.0) < 1e-9
-                            for x in moved),
-              f"{len(moved)} visit(s)")
-        # And keeps the one it replaced. A pin stands at a doorway, so
-        # dragging it says where that doorway is and nothing else -- the
-        # drawing has to go on being pinned at the same point inside and
-        # simply move. Overwriting the anchor outright left the viewer nothing
-        # to pin to, so it centred the whole shape on the pin instead: on the
-        # cave that was reported, the drawing then sat **96 m** from the
-        # marker, whichever way you dragged it.
-        check("and the anchor it replaced is kept, to go on being pinned by",
-              moved and all(x.get("door_wx") is not None
-                            and x.get("door_placed") not in (None, "by hand")
-                            for x in moved),
-              f"{[x.get('door_placed') for x in moved]}")
+        moved = [x for x in store.interior_visits()
+                 if x["map_id"] == walked["map_id"]]
+        # This one is made now, which is after everything the fixture
+        # recorded -- so it is you looking at where the route put the pin and
+        # saying no, and it wins. Four of the six placements in the live
+        # database were being thrown away, every one of them made after the
+        # doorway it was losing to and two of them within the half hour
+        # before it was reported: dragging a pin did nothing at all.
+        check("a hand placement made after the route measured the door wins",
+              moved and all(x["placed"] == "by hand"
+                            and abs(x["wx"] - 1234.0) < 1e-9 for x in moved),
+              f"{[x['placed'] for x in moved]}")
+        # And the other way round, which is the case the original rule was
+        # written for: Leyndell, placed from a teleport in when nothing had
+        # ever walked its front gate, and beaten the day something did --
+        # because that walk is newer than the drag. Backdated rather than
+        # re-recorded, since POST /api/place always stamps the moment it runs.
+        store.db.execute("UPDATE map_places SET set_ms = ? WHERE map_id = ?",
+                         (walked["entered_ms"] - 1, walked["map_id"]))
+        store.db.commit()
+        older = [x for x in store.interior_visits()
+                 if x["map_id"] == walked["map_id"]]
+        check("and one made before it gives way to the doorway",
+              older and all(x["placed"] == "entrance"
+                            and abs(x["wx"] - 1234.0) > 1e-6 for x in older),
+              f"{[x['placed'] for x in older]}")
         st_, cleared = await post("/api/place",
-                                  {"map_id": v0["map_id"], "clear": True})
+                                  {"map_id": walked["map_id"], "clear": True})
         check("and it can be taken back", st_ == 200 and cleared["ok"]
               and not store.places())
+        # And the other half: somewhere the route has no doorway for. Then the
+        # hand placement is the answer, and it keeps the anchor it replaced --
+        # a pin stands at a doorway, so dragging it says where that doorway is
+        # and nothing else, and the drawing goes on being pinned by the same
+        # point inside and simply moves. Overwriting the anchor outright left
+        # the viewer nothing to pin to, so it centred the whole shape on the
+        # pin instead: on the cave that was reported the drawing then sat
+        # 96 m from the marker, whichever way you dragged it.
+        # By map, not by visit: one measured doorway retires the guess for
+        # every visit to that place, so a map with any measured visit at all
+        # is not the case this is about.
+        tiers = {}
+        for x in store.interior_visits():
+            tiers.setdefault(x["map_id"], set()).add(x["placed"])
+        guessed_map = next((m for m, t in tiers.items()
+                            if not ({"entrance", "exit"} & t)), None)
+        guessed = ({"map_id": guessed_map} if guessed_map is not None else None)
+        if guessed is not None:
+            st_, put2 = await post(
+                "/api/place",
+                {"map_id": guessed["map_id"], "wx": 4321.0, "wz": 8765.0})
+            hand = [x for x in store.interior_visits()
+                    if x["map_id"] == guessed["map_id"]]
+            check("and a place it cannot measure is still yours to put down",
+                  st_ == 200 and put2["ok"]
+                  and hand and all(x["placed"] == "by hand"
+                                   and abs(x["wx"] - 4321.0) < 1e-9
+                                   for x in hand),
+                  f"{[x['placed'] for x in hand]}")
+            # What the route said is carried through beside it, whatever
+            # that was -- including "nothing", which is the case a hand
+            # placement now mostly exists for. Where there was a position,
+            # it comes with it.
+            check("and the anchor it replaced is kept, to go on being pinned by",
+                  hand
+                  and all(x.get("door_placed") not in (None, "by hand")
+                          for x in hand)
+                  and all(x.get("door_wx") is not None for x in hand
+                          if x.get("door_placed") != "unknown"),
+                  f"{[x.get('door_placed') for x in hand]}")
+            await post("/api/place", {"map_id": guessed["map_id"], "clear": True})
         st_, bad_place = await post("/api/place", {"wx": 1.0})
         check("placing needs to say which map", st_ == 400)
+        # The rule itself, in the one place it is decided: per map, and only
+        # the two tiers that are readings rather than inferences.
+        store_py_src = (ROOT / "tracker" / "store.py").read_text(encoding="utf-8")
+        check("the rule is per map, and only a measured tier retires the drag",
+              'measured = {v["map_id"] for v in out' in store_py_src
+              and 'if v["placed"] in ("entrance", "exit")' in store_py_src
+              and 'and v["entered_ms"] > set_at.get(v["map_id"], -1)}'
+                  in store_py_src
+              and 'if v["map_id"] in hands and v["map_id"] not in measured:'
+                  in store_py_src)
+        # A place a route can never measure is put down once and kept in
+        # config, so it ships with the tool rather than with one database. A
+        # drag lives in `map_places`, which travels with that file and nothing
+        # else: without this a fresh install draws Farum Azula and the Chapel
+        # in the corner of the screen however many times somebody has already
+        # worked out where they go. Measured on a copy with the drags deleted:
+        # `unknown` and no position without it, `from config` at the right
+        # place with it.
+        coords_src = (ROOT / "tracker" / "coords.py").read_text(encoding="utf-8")
+        server_src = (ROOT / "tracker" / "server.py").read_text(encoding="utf-8")
+        check("a position can ship with the tool instead of with a database",
+              'maps.get("map_place", {})' in coords_src
+              and "def parse(cls, name: str)" in coords_src
+              and "self.store.shipped = dict(self.maps.map_places)" in server_src
+              and "[maps.map_place]" in
+                  (ROOT / "config" / "config.toml").read_text(encoding="utf-8"))
+        # Yours over the tool's, and a measured doorway over both.
+        check("and your own drag still wins over the one that shipped",
+              'hands = {**{k: (v, "from config") for k, v in self.shipped.items()},'
+              in store_py_src
+              and '**{k: (v, "by hand") for k, v in by_hand.items()}}'
+                  in store_py_src)
+        # And a list of what is left to do by hand, for a database that is
+        # going to be shipped: every place with no position, and every place
+        # standing on something weaker than a doorway. It has to agree with
+        # the store about which tiers those are.
+        places_py = (ROOT / "tools" / "places.py")
+        places_src = places_py.read_text(encoding="utf-8") if places_py.exists() else ""
+        check("and a list of which places still need putting on the map",
+              'MEASURED = ("entrance", "exit")' in places_src
+              # Interiors only: a visit is any stay in any map, and the
+              # overworld tiles are drawn by the route itself.
+              and 'if v["layer"] not in ("interior", "unknown"):' in places_src
+              and "tools/places.py" in
+                  (ROOT / "docs" / "MANUAL.md").read_text(encoding="utf-8"))
 
         # Saying a place is nowhere is a different answer from not knowing
         # where it is, and clearing cannot stand in for it: clearing hands the
         # question back to the tiers, and they always answer. On routes.db the
         # Roundtable Hold then takes an `exit` anchor from the one time
-        # leaving it did not look like a warp.
+        # leaving it did not look like a warp. It outranks a measured doorway
+        # as well, which a hand placement no longer does -- "this is not
+        # anywhere" is not a guess at a position, it is a statement that there
+        # is none.
+        v0 = walked
         st_, nw = await post("/api/place",
                              {"map_id": v0["map_id"], "nowhere": True})
         check("a dungeon can be said to be nowhere at all",
@@ -2931,6 +3159,136 @@ def main() -> int:
               and "playTrimUI();" in ps
               and "play.loop = true;" in ps
               and "state.sessions.add(s.id);" in ps)
+        # And the list comes to the map while the playback runs. The panel has
+        # one already, but during a playback it is three sections down a column
+        # you have to scroll -- and the one thing you want while watching is
+        # "play that evening instead". Everything that does not belong out
+        # there is off it: no checkbox, since what is drawn is the playback's
+        # business now, and no delete, which is not a thing to press by
+        # accident while watching.
+        psr = (page[page.index("function playSessionRow("):
+                    page.index("function buildPlaySessions(")]
+               if "function playSessionRow(" in page
+               and "function buildPlaySessions(" in page else "")
+        trim = (page[page.index("function playTrimUI("):][:200]
+                if "function playTrimUI(" in page else "")
+        check("the playback carries its own list of sessions",
+              bool(psr)
+              and 'id="play-sessions" hidden' in html
+              and "control('play-sessions').hidden = false;" in page
+              and "control('play-sessions').hidden = true;" in page
+              and "row.addEventListener('click', () => playSession(s));" in psr
+              and "checkbox" not in psr
+              and "confirmDelete" not in psr
+              # The mark says which session the two grips are around, so it is
+              # kept by the one function that runs whenever they move.
+              and "playSessionsMark();" in trim
+              # Folded away if you do not want it there, and it remembers.
+              and "savePref('psShut', shut);" in page)
+        # Where the playhead is, which is a different question from what the
+        # grips are around -- and one the clock cannot answer, because
+        # sessions overlap: an imported afternoon and the live session
+        # covering it both contain the same moment, and on routes.db four
+        # sessions contain one. route() already cuts its segments at the
+        # session boundary, so the run under the playhead knows.
+        check("the playback says which session you are in, from the recording",
+              '"session": seg.get("session"),' in server_py
+              and "session: seg.session," in page
+              and "play.nowRun = run;" in page
+              and "function playSessionNow(" in page
+              and "const s = all.find((x) => x.id === run.session);" in page
+              # And the way back to the whole route, which only offers itself
+              # when there is something to undo.
+              and 'id="ps-all"' in html
+              and "play.from = 0;\n    play.until = play.to;" in page
+              and "control('ps-all').hidden = play.from <= 0 "
+                  "&& play.until >= play.to;" in page
+              # And it says what it is: the session on screen, not where the
+              # reader is. "Where you are" was the playhead's answer written
+              # as if it were the user's.
+              and '<p class="ps-cap">Current session displayed</p>' in html)
+        # It is the one action in that panel rather than another row of it,
+        # and it is only up while there is something to undo.
+        check("and the way back to the whole route is the accent",
+              "#play-sessions #ps-all {" in sheet
+              and "background: var(--route);" in
+                  sheet[sheet.index("#play-sessions #ps-all {"):][:400])
+        # Five at a time grew the panel five rows per press, and its top is
+        # pinned 16px down -- so the button doing the growing walked off the
+        # bottom of the screen and could not be pressed again. All of them at
+        # once, with the list scrolling inside a panel that has a ceiling.
+        check("and the whole list opens at once and scrolls",
+              "playSessShown = Infinity;" in page
+              and "more.textContent = `Show all ${newest.length}`;" in page
+              and "max-height: calc(100vh - 132px);" in
+                  sheet[sheet.index("#play-sessions {"):][:900]
+              and "#ps-list { flex: 1 1 auto; min-height: 0; "
+                  "overflow-y: auto; }" in sheet)
+        # Reaching for the thickness while watching threw you out of the
+        # playback, because redrawEverything() ends it before it redraws --
+        # and the weight was baked into the script at build time, so it could
+        # not have followed the slider anyway.
+        check("the path controls reach a playback instead of ending it",
+              "if (play.on) { playLookChanged(key); return; }" in page
+              and "function playWeight(run)" in page
+              and "weight: playLineWeight(run, open, faint)," in page
+              and "function playRestyle(" in page
+              # The outline is a layer per run rather than a width on one, so
+              # one appearing has to be laid down under the lines, not over.
+              and "if (on !== play.casingOn) {" in page
+              and "state.casing > 0" in
+                  page[page.index("function playLine("):
+                       page.index("function playRestyle(")])
+        # The mark on the timeline says where the path under the cursor was
+        # walked, so it has to go when the cursor is somewhere else -- and a
+        # press that begins on the path is a map drag, which can carry the
+        # pointer onto the bar with the map none the wiser.
+        check("the hover mark goes when the cursor reaches the bar",
+              "for (const id of ['timeline', 'play-sessions', 'toll', 'inset']) {"
+              in page
+              and "control(id).addEventListener('pointerenter', "
+                  "() => playHover(null));" in page
+              and "map.getContainer().addEventListener('mouseleave', "
+                  "() => playHover(null));" in page)
+        # The window for a place that is nowhere is opened from a button in
+        # the corner, so it has no marker to click off -- and the drawing in
+        # it is the only picture of that place there is, so it zooms.
+        check("the window that is nowhere closes on the map and zooms",
+              "closeInterior();" in
+                  page[page.index("map.on('click', (e) => {"):
+                       page.index("map.on('mousemove'")]
+              and "function insetZoomAt(" in page
+              and "insetView.zoom * factor" in page
+              and "cv.addEventListener('wheel'" in page
+              and "cv.addEventListener('dblclick'" in page
+              and "if (state.insetKey !== insideKey(v)) insetReset();" in page)
+        # Amber at a low alpha over the dark teal mixes to an olive that is
+        # neither of the two colours the page is made of. A row lifts with
+        # neutral light and says it is the chosen one with the accent at full
+        # strength, in a bar down its edge.
+        def body(sel):
+            r = sheet[sheet.index(sel):] if sel in sheet else ""
+            return r[:r.index("}")] if r else ""
+        check("the accent is used at full strength or not at all",
+              # The chosen row: neutral light, and the accent in a bar down
+              # its edge rather than washed across it.
+              "inset 2px 0 0 var(--route)" in body(".ps-row.on {")
+              and "rgba(224" not in body(".ps-row.on {")
+              and "rgba(224" not in body(".ps-row:hover {")
+              and "rgba(224" not in body("details.fold > summary:hover {")
+              and "rgba(224" not in body(".picker-list button:hover {")
+              # And the playback button answers with a standing state that
+              # leaves the plate alone. Not the sheen travelling across it,
+              # not the ring that replaced the sheen -- both of those were
+              # something that happens -- and not brightening the plate
+              # either: the light goes around it. Asked for as "a constant
+              # hover state", then "I don't really like the brighten effect".
+              and "box-shadow: 0 0 0 1px var(--acc-ring), "
+                  "0 0 24px -2px var(--acc-glow);"
+                  in body(".play-btn:hover {")
+              and "background:" not in body(".play-btn:hover {")
+              and "left: 115%" not in sheet
+              and "play-ring" not in sheet)
         for control, what in (("tint-mode", "how the path is coloured"),
                               ("line-weight", "how thick it is"),
                               ("line-casing", "how much outline it carries"),
@@ -2967,8 +3325,15 @@ def main() -> int:
         check("a styled slider is told how much of it is filled",
               "function paintRange(" in page
               and "el.style.setProperty('--fill'" in page
-              and page.count("paintRanges();") >= 2
-              and "var(--fill, 50%)" in sheet)
+              # Wired once, and repainted wherever a value is set rather than
+              # dragged -- the align sliders going back to zero.
+              and "wireRangeFills();" in page
+              and "paintRanges();" in page
+              and "var(--fill, 0.5)" in sheet
+              # Painted on every drag, not once at boot: without this the
+              # dot moved and the trail stayed where the page loaded it.
+              and "el.addEventListener('input', () => paintRange(el));"
+                  in page)
         # Drawn rather than shipped, so it works with no binary asset -- and
         # replaced by viewer/compass.png the moment there is one.
         check("there is a compass", 'id="compass"' in html
@@ -3000,9 +3365,37 @@ def main() -> int:
         # redrew the lot. After: 134 s over the 130 s that passed, 8 stretches
         # changing colour along the way, and the legend's older end walking
         # from 12:12 to 12:19.
+        # And wherever you are standing. It sat in the branch that handles a
+        # sample with a world position, so walking into a dungeon froze the
+        # near end: every sample inside was then newer than the newest end,
+        # clamped to the top of the ramp, and an hour in a castle came out
+        # entirely in the newest colour. Reported from the field. It is above
+        # every type branch now, which is also why the guard on `s.t` -- a
+        # death message carries `ts` and no position at all.
+        feed = (page_js[page_js.index("ws.onmessage = (ev) => {"):]
+                if "ws.onmessage = (ev) => {" in page_js else "")
         check("the newest end of the gradient follows the live feed",
-              "if (state.span && s.t > state.span[1]) state.span[1] = s.t;"
-              in page_js)
+              "if (typeof s.t === 'number' && state.span && s.t > state.span[1]) {"
+              in feed
+              and feed.index("state.span[1] = s.t;")
+                  < feed.index("if (s.type === 'interior') {"))
+        # And it reaches what is drawn inside a dungeon. Those samples are
+        # not in the route's segments -- they have no world position, which is
+        # the whole reason interiors are drawn separately -- so the span came
+        # from the surface alone, and a visit running past the last surface
+        # sample sat beyond the near end of the ramp: everything in it clamped
+        # to the newest colour, and since every horizon is measured back from
+        # that same end, no setting of the slider changed anything in there.
+        # Reported from the field on an offline map. Measured on routes.db at
+        # the fifteen-minute horizon: the castle's points used 1 band before
+        # and 12 after, and the drawn layers carry 9 distinct colours where
+        # they carried one.
+        check("the age ramp counts what is drawn inside a dungeon too",
+              "function spanWithInsides(" in page
+              and "state.span = spanWithInsides(timeSpan(segments));" in page
+              and "function noteInsideSpan(" in page
+              and "noteInsideSpan(data.visits);" in page
+              and "state.insideSpan = t0 === Infinity ? null : [t0, t1];" in page)
         # Recoloured, not refetched: a refetch is a hundred times the work to
         # recover a picture already on the screen. playRecolour()'s idea, for
         # the map. 0.3 ms median and 1 ms worst over 340 drawn stretches,
@@ -3175,11 +3568,17 @@ def main() -> int:
         # The line a jump draws is the journey being made, so it belongs to
         # the moment. Drawn on a seek too, scrubbing strung one across the map
         # for every teleport in the route and left them there.
-        warp = page[page.index("if (kind === 'warp' && e.from) {"):
-                    page.index("// The lasting mark, so the playback")]
+        # Sliced on the departure branch, and asked for with `in` before it
+        # is cut: `.index()` raises rather than failing, which takes the
+        # whole run down instead of reporting one red line.
+        warp = ""
+        if "  if (departs) {" in page and "// The lasting mark" in page:
+            warp = page[page.index("  if (departs) {"):
+                        page.index("// The lasting mark, so the playback")]
         check("the line a jump draws is only there while it is being made",
-              "if (animate) {" in warp and "const arc = L.polyline(" in warp
-              and warp.index("if (animate) {")
+              "if (animate && arrives) {" in warp
+              and "const arc = L.polyline(" in warp
+              and warp.index("if (animate && arrives) {")
                   < warp.index("const arc = L.polyline("))
         # Clicking the map puts away a pinned dungeon overlay -- but during
         # playback the overlay is what the playback is drawing, so a click
@@ -3253,7 +3652,7 @@ def main() -> int:
                     page.index("const PLAY_GLYPH")]
         check("and its path is drawn on the map, not in the cave overlay",
               "line.addTo(open ? play.group : insideGroup);" in line
-              and "if (faint && !open) {" in line)
+              and "if (faint && !open) style.opacity = 0.4;" in line)
         check("and a mark made in one lasts like the world's",
               "const where = playOpen(e.where);" in
               page[page.index("function playFlash("):
@@ -3291,8 +3690,20 @@ def main() -> int:
                        page.index("const AGE_DEPTHS")]
         check("the age ramp is not quantised to a hundredth of the route",
               "const a = q[lo - 1], b = q[lo];" in rank_fn
-              and "return (lo - 1 + f) / (q.length - 1);" in rank_fn
+              and "return (lo - 1 + f) / steps;" in rank_fn
               and "return lo / (q.length - 1);" not in rank_fn)
+        # And the play since the quantiles were fetched is not all one rank.
+        # It is newer than the last quantile, so it came back as exactly 1 --
+        # which on the surface is the head of a long route and inside a
+        # dungeon is the whole drawing, since the only thing on screen is the
+        # visit you are in. Measured on a cave entered a second after the
+        # last quantile: 1 colour at every horizon before, 12 at the
+        # fifteen-minute one after, with the old rule put back giving 2.
+        check("and the play since the quantiles were fetched gets a share of it",
+              "const newest = state.span ? state.span[1] : last;" in rank_fn
+              and "const extra = newest > last ? 1 : 0;" in rank_fn
+              and "const steps = q.length - 1 + extra;" in rank_fn
+              and "Math.min(1, (t - last) / (newest - last))" in rank_fn)
         check("and it drifts rather than stepping between twelve colours",
               "ageColor(playAgeAt(run))" in page
               and "const PLAY_RECOLOUR_MS = PLAY_TICK_MS;" in page
@@ -3308,6 +3719,54 @@ def main() -> int:
         check("a death inside a dungeon is never drawn at its entrance",
               "playVisitAt(frames, d.map_id, d.ts)" in pe
               and "if (!hit) continue;" in pe)
+        # And so is a teleport. Reported from the field: "during playback,
+        # when I teleported into a legacy dungeon, it showed that I
+        # teleported to the entrance, but I actually teleported inside."
+        # The playback asked one question of a jump -- `w.inside`, which
+        # means *both* ends in one dungeon -- and sent everything else to the
+        # world on `w.xy`, which for an end inside a dungeon is that
+        # dungeon's pin. The arrival's own local position was in the payload
+        # the whole time; the finished map was fixed for this and the
+        # playback never was. Measured on routes.db: 15 arrivals inside a
+        # dungeon, now drawn 7 to 440 px from the pin they were drawn at.
+        check("and neither is a teleport that lands inside one",
+              "const inHit = w.local ? playVisitAt(frames, w.map_id, w.ts) "
+              ": null;" in pe
+              and "playVisitAt(frames, w.from_map_id, w.from_ts) : null;" in pe
+              and "const to = inHit ? inHit.f.tf(w.local[0], w.local[1]) "
+                  ": w.xy;" in pe
+              and "where: inHit ? inHit.key : 'world'," in pe)
+        # Each end of a jump is in its own place, and resolving both against
+        # the arrival's put a mark drawn in a cave's own frame into the
+        # world's marks -- where it stayed for the rest of the playback,
+        # standing on open ground at a spot inside a cave that had come off
+        # the map. Measured on routes.db: six such departures, 14 to 270 px
+        # adrift, and all six now on their cave's pin, which is the stand-in
+        # the finished map draws for the same end.
+        flash = page[page.index("function playFlash("):
+                     page.index("// The mark arriving: too small to see")]
+        check("and each end of one is drawn in the place it belongs to",
+              "from_where: outHit ? outHit.key : 'world'," in pe
+              and "from_pin: w.from_xy," in pe
+              and "const fromOpen = playOpen(e.from_where || 'world');" in flash
+              and "const fromInside = !fromOpen && fromHere;" in flash
+              and "const fromXY = fromHere ? e.from : e.from_pin;" in flash
+              and "playMark(kind, fromXY, fromInside ? 'playinside' "
+                  ": 'playmarks'," in flash
+              and "fromInside ? play.insideMarks : play.marks, e);" in flash)
+        # A jump seeked past can have an arrival there is no frame for -- the
+        # cave is not on the screen -- while the surface it set off from is
+        # right there. The map draws that end whether or not the other one
+        # can be drawn; the playback used to lose both.
+        check("and one end being undrawable does not take the other with it",
+              "const arrives = home || playSamePlace(play.where, e.where);"
+                  in flash
+              and "const departs = kind === 'warp' && !!fromXY;" in flash
+              and "if (!arrives && !departs) return;" in flash
+              and "if (!arrives) return;" in flash
+              # The line and the pan belong to a journey with both ends on
+              # the screen.
+              and "if (animate && arrives) {" in flash)
         check("and it is placed by the visit it happened in, not the map",
               "frames.set(key," in page and "insideKey(v)" in
               page[page.index("let runs = playRuns(world"):
@@ -3539,7 +3998,7 @@ def main() -> int:
         # the pop on each, are what say it now.
         flash = page[page.index("function playFlash("):page.index("function playLand(")]
         check("both ends of a teleport are marked",
-              "playMark(kind, e.from," in flash
+              "playMark(kind, fromXY," in flash
               and "playMark(kind, e.xy," in flash
               and "playLand(left);" in flash
               and "playLand(lasting)" in flash)
@@ -3598,12 +4057,51 @@ def main() -> int:
         # visit used, and the frame was taken from the first visit that
         # walked in -- which can be the mouth used once against one used four
         # times, with the whole dungeon drawn from the odd one out.
+        srv_doors = (ROOT / "tracker" / "server.py").read_text(encoding="utf-8")
+        srv_doors_store = (ROOT / "tracker" / "store.py").read_text(encoding="utf-8")
         check("a dungeon's marker goes to the doorway its visits agree on",
-              "function agreedDoor(" in page
-              and "const door = agreedDoor(data.visits, group[0].map_id);" in page
-              and "const weight = (v) => Math.max(1, (v.duration_ms || 0) / 1000);"
-                  in page
+              "function agreedDoorway(" in page
+              and "const doorway = agreedDoorway(data.visits, "
+                  "group[0].map_id, routeDoor);" in page
+              and "const list = doorwaysOf(here, at, false);" in page
               and "const SAME_DOOR_M = 15;" in page)
+        # Which mouth is one question and which reading of it to believe is
+        # another, and telling them apart needs the half of a doorway that
+        # nothing was sending: where it puts you *inside*. On m31_15 two
+        # readings of one mouth are 19 m apart outside and 10 m apart inside,
+        # while its two real mouths are 177 m apart outside and 184 m inside
+        # -- so no distance measured outside can answer it, and the coarse
+        # reading was drawn as a mouth of its own standing on the real one.
+        # Reported: "the cave m31_15_00_00 has the exit icon on the entrance,
+        # and the normal icon is just kinda beside it."
+        check("and what counts as one doorway is decided inside the place",
+              "function doorwaysOf(" in page
+              and "function sameMouth(" in page
+              and "if (a.local && b.local && metresApart(a.local, b.local) "
+                  "< SAME_DOOR_M) {" in page
+              and "local: v.first_local || null" in page
+              and '**({"first_local": [round(v["first_x"], 2),' in srv_doors)
+        # The way out is a doorway too, and for a cave walked in one mouth and
+        # out the far one it is the only reading that mouth ever gets: the
+        # `exit` tier only consults it for a visit with no entrance of its
+        # own. Reported in the same breath as "there is nothing in the actual
+        # exit". Measured after: that far mouth lands 0 m from where the
+        # recording puts it, 181 m from the pin in a place 233 m across.
+        check("and the way out is one of them",
+              "if (withExits && v.exit_xy && v.exit_local) {" in page
+              and "found = exit_anchor(left)" in srv_doors_store
+              and 'v["exit_wx"], v["exit_wz"] = found' in srv_doors_store
+              and '"exit_xy": [round(c, 2) for c in' in srv_doors)
+        # Bounded to one visit. A stay that stored nothing at all took the
+        # first sample of a *later* stay to the same map, which on this cave
+        # is 2,076 seconds afterwards and in another part of the place.
+        check("and a visit's doorway is its own",
+              "def first_local(map_id: int, at_or_after: int, before=None):"
+                  in srv_doors_store
+              and "def last_local(map_id: int, before: int, at_or_after=0):"
+                  in srv_doors_store
+              and "gone = last_local(v[\"map_id\"], left, v[\"entered_ms\"])"
+                  in srv_doors_store)
         # Which mouth you use a place through, and which *reading* of that
         # mouth to hang the drawing on, are two questions. Time answers the
         # first and agreement answers the second: a doorway read five times
@@ -3637,7 +4135,7 @@ def main() -> int:
         mouths = ""
         if "function otherMouths(" in page:
             mouths = page[page.index("function otherMouths("):
-                          page.index("function agreedDoor(")]
+                          page.index("function agreedDoorway(")]
         #
         # The `room &&` is load-bearing and is part of the same string: a
         # dungeon with nothing recorded inside says nothing about its own
@@ -3661,6 +4159,25 @@ def main() -> int:
         if "function warpsInside(" in page:
             ins = page[page.index("function warpsInside("):
                        page.index("function deathsInside(")]
+        # Where the recording cannot say which reading is the grace, the mark
+        # asks. One at a time, because a cluster can hold a dozen and only
+        # you know which of them landed wrong; and the same button puts it
+        # back, so there is never a choice of two directions to make.
+        resp = ""
+        if "function respawnPopup(" in page:
+            resp = page[page.index("function respawnPopup("):]
+            resp = resp[:resp.index("\n}")]
+        check("a grace that landed in the wrong place can be corrected",
+              "const one = n === 1 ? c.list[0] : null;" in resp
+              and "'The grace is the next point'" in resp
+              and "'Put the grace back'" in resp
+              and "callGrace(one.died_ts, one.step ? 0 : one.step + 1);" in resp
+              and "function callGrace(" in page
+              and "popup: markPopupEl(m)," in page
+              and "fetch('/api/grace'" in page
+              and 'web.post("/api/grace", self.grace),' in srv_i
+              and '"grace_step": d.get("grace_step", 0),' in srv_i)
+
         check("a jump with one end in a dungeon is drawn where it happened",
               "if (w.local && w.map_id === v.map_id && within(w.ts))" in ins
               and "w.from_local && w.from_map_id === v.map_id" in ins
@@ -3675,9 +4192,12 @@ def main() -> int:
         # lead to when hovering, and some always show where, even when you're
         # not hovering."
         check("where a jump goes is shown while you point at it, and not else",
-              "mark.on('mouseover', () => showWarpLines([pair], group, "
-              "lineRenderer));" in page
-              and "mark.on('mouseout', hideWarpLines);" in page
+              # The cell carries the pairs and wireMarkHover() draws them, so
+              # a mark that shares its spot with a death answers for both.
+              "warps: always ? []" in page
+              and ": c.list.map((e) => e.pair).filter((p) => p[0] && p[1])," in page
+              and "if (warps.length) showWarpLines(warps, into, lineRenderer);"
+                  in page
               and "function showWarpLines(pairs, into, lineRenderer) {" in page)
         # One end in this dungeon's frame and one out on the surface is still a
         # line: they are different coordinate spaces right up until both are
@@ -3686,6 +4206,40 @@ def main() -> int:
         check("and a jump with one end on the surface still says where it went",
               "const endAt = (which) => {" in page
               and "return which === 'to' ? jump.xy : jump.from_xy;" in page)
+        # And which way it went. Asked for: "could you make the dotted lines
+        # between teleport markers move in the teleport direction". The pair
+        # is always [where you left, where you arrived] and an SVG path is
+        # drawn from its first point to its last, so walking the dash offset
+        # towards negative runs the dashes along the way you travelled --
+        # measured on the live viewer, the path's first point is the
+        # departure and the offset goes 0 to -24 over the cycle.
+        #
+        # SVG rather than the canvas the rest of the drawing is on: canvas
+        # has no dash offset, and stepping one by hand would repaint the
+        # whole route sixty times a second to shift a few dashes.
+        css_jump = sheet[sheet.index("@keyframes jump-run"):] \
+            if "@keyframes jump-run" in sheet else ""
+        check("and the dashes run the way the jump went",
+              "function jumpLine(lineRenderer) {" in page
+              and "renderer: dashesIn(lineRenderer)," in page
+              and "className: 'jump-line'," in page
+              and "dashPanes.set(pane, L.svg({ pane, padding: 0.5 }))" in page
+              # One place builds them, so a line cannot be drawn some other
+              # way and quietly stand still: the world's hover, a castle's
+              # hover and the line standing inside a cave all ask for it.
+              and page.count("dashArray: '5,7'") == 1
+              and page.count("jumpLine(lineRenderer))") == 2
+              and page.count("function jumpLine(") == 1
+              and "L.polyline([toLatLng(a), toLatLng(b)], "
+                  "jumpLine(lineRenderer))" in page
+              # -24 is two whole dash periods of 5 + 7, so the pattern
+              # repeats seamlessly rather than jumping at the end of a cycle.
+              and "stroke-dashoffset: -24;" in css_jump
+              and "path.jump-line { animation: jump-run 1.1s linear infinite; }"
+                  in css_jump
+              # The direction is the extra here -- the line still says where
+              # it goes without it.
+              and "@media (prefers-reduced-motion: reduce) {" in css_jump)
         # The moment to test a departure against is its own: a jump *out* of
         # here carries the arrival's timestamp, which is after you left. On
         # routes.db that is all ten of them.
@@ -3698,11 +4252,38 @@ def main() -> int:
         # only up while you hover it, and hovering dims the world's marks.
         check("and the stand-in at the pin comes off when the place is drawn",
               "state.alwaysDrawn && state.alwaysDrawn.has(map_id)" in page
-              and "addWarpMarks(outside.filter((w) => shown(w, 'to')), 'to');"
-                  in page)
+              and "const list = warpEnds(end);" in page)
         # ...but only while it is drawn. Unticking Caves and dungeons takes
         # the castles off the map, and the marks that stood down in favour of
         # them are not caves and must come back.
+        # Fetch first, clear second -- the rule the route and the teleport
+        # marks already follow, and the one place still doing it the other way
+        # round. Clearing at the top took every castle off the map for the
+        # length of the fetches, which is nothing from outside (every finished
+        # visit is cached) and a flicker every five seconds while you are
+        # inside one: refreshLiveInside() drops the open visit from the cache
+        # each time, exactly because it is still being written, so that one is
+        # a real round trip with the whole place missing for it. Measured with
+        # a 60 ms delay on each interior fetch: blank from the first frame
+        # before, 0 blank frames of 404 after.
+        wv = (page[page.index("async function drawWorldVisible("):
+                   page.index("/* --- interiors drawn where they happened")]
+              if "async function drawWorldVisible(" in page
+              and "/* --- interiors drawn where they happened" in page else "")
+        check("the castles stay on the map while they are being redrawn",
+              bool(wv)
+              and "const built = [];" in wv
+              and "built.push([v, d]);" in wv
+              # Two clears and no more: one for the layer being switched off,
+              # one for the swap. A third at the top is the regression, and
+              # counting is what catches it -- asking where the *last* one
+              # falls does not, since an early clear leaves that one alone.
+              and wv.count("placedGroup.clearLayers();") == 2
+              and wv.index("if (!state.layers.interior) {")
+                  < wv.index("placedGroup.clearLayers();")
+              and wv.index("built.push([v, d]);")
+                  < wv.rindex("placedGroup.clearLayers();")
+                  < wv.index("drawInteriorInto(layer"))
         check("and goes back on when the dungeons are turned off",
               page.count("state.alwaysDrawn = new Set();") == 2
               and "loadInteriors();" in page
@@ -3710,11 +4291,48 @@ def main() -> int:
         # Where a dungeon is, is borrowed by every mark inside it that has
         # nowhere else to be drawn. Moving it has to move all of them, and the
         # drag moved the pin and the path alone.
+        # Counted against the ways a placement can change rather than against
+        # a number, so adding a fifth says so instead of quietly passing.
+        placers = ("async function placeDungeon(", "async function placeAt(",
+                   "async function unplaceDungeon(",
+                   "async function resetPlacement(")
         check("moving a dungeon moves everything drawn at its position",
               "async function afterPlacing() {" in page
-              and page.count("await afterPlacing();") == 3
+              and all(f in page for f in placers)
+              and page.count("await afterPlacing();") == len(placers)
               and "await loadWarps();" in
                   page[page.index("async function afterPlacing() {"):][:400])
+        # A position is half a frame. The other half is which point inside the
+        # place that position belongs to -- and it used to come from whatever
+        # the route called the doorway at the moment of drawing, so the
+        # meaning of a hand placement changed under it whenever the route
+        # learned a better door.
+        #
+        # Leyndell is the case, reported from the field: placed by hand on
+        # 5 September, when the only visit was a teleport in and the drawing
+        # was therefore centred on its own extent; on the 13th somebody walked
+        # in the front door, the frame rebased onto that door 440 m away
+        # inside the place, and the castle -- the new run and every old one --
+        # moved by that much. Measured after: the frame keeps the point the
+        # drag named however the route's own door moves.
+        store_py = (ROOT / "tracker" / "store.py").read_text(encoding="utf-8")
+        check("a drag records which point inside the place it put there",
+              "ALTER TABLE map_places ADD COLUMN local_x" in store_py
+              and "def place_bases(" in store_py
+              and 'local = body.get("local")' in server_py
+              and '"hand_local"' in server_py
+              and "async function handBase(" in page
+              and "local: await handBase(v) }" in page
+              and "const base = mine.length ? mine[0].hand_local : null;" in page)
+        # And the way back out of one the route has outgrown. Clearing hands
+        # the question to the tiers, which is exactly what is wanted once they
+        # can answer it -- and it is not the same as saying a place is
+        # nowhere, which is the other button on that popup.
+        check("and there is a way back to the route's own answer",
+              "async function resetPlacement(" in page
+              and "{ map_id, clear: true }" in page
+              and "Use the route's own position" in page
+              and "{ map_id, nowhere: true }" in page)
         # Dragging a marker says where its doorway is, not what the drawing
         # should be pinned by. The frame is learned from the route for every
         # dungeon now -- the doorway inside, and the turn if a second door
@@ -3783,9 +4401,62 @@ def main() -> int:
               "function redrawLiveInside(" in page
               and "state.liveInside.push(s.local);" in page
               and "insideLiveGroup = L.layerGroup().addTo(map);" in page)
+        draw_inside = page[page.index("function drawInside("):][:2600]
+        # In the same frame as the path, not a task later. Within one canvas
+        # the order layers go on is the order they are painted, so re-adding
+        # the path puts it over the tail; putting the tail back on a
+        # setTimeout left a window where a paint could catch the whole cave
+        # wearing the drawing underneath, casing and all. Once every five
+        # seconds, which is what "every few seconds the path flickers once"
+        # was.
         check("and it survives the overlay being redrawn under it",
-              "setTimeout(redrawLiveInside, 0);" in
-              page[page.index("function drawInside("):][:400])
+              "redrawLiveInside();" in draw_inside
+              and "inside.drawnTo = drawnUpTo(d);" in draw_inside
+              and "setTimeout(redrawLiveInside" not in page)
+        # The tail used to hold everything since you walked in and nothing
+        # ever took any of it back, so after nine minutes in a cave it was
+        # 751 points in one hardcoded colour lying over a committed path of
+        # 778 across the same 204 by 225 m -- two drawings of one walk, with
+        # the flat one on top. That is the whole of "the cave I'm in, the 'by
+        # age' doesn't seem to work in it": the banded drawing was never the
+        # one you could see, and the height ramp was hidden just as
+        # completely. Measured after: 2 to 10 points, 0.5 to 5 s of walking,
+        # and the first of them is the last point of the drawing underneath,
+        # so the two join rather than leaving a gap.
+        tail_fn = page[page.index("function redrawLiveInside("):
+                       page.index("// Looking at the world from inside a cave.")]
+        check("the tail inside a dungeon starts where the drawing stops",
+              "const from = inside.drawnTo || 0;" in tail_fn
+              and "if (t !== null && t !== undefined && t < from)" in tail_fn)
+        check("and it is banded by age like the route it is extending",
+              "const flat = state.tint !== 'age';" in tail_fn
+              and "ts.map((t) => (t === null || t === undefined ? null : ageBand(t)))"
+              in tail_fn
+              and "color: flat ? (state.tint === 'solid' ? state.colour : '#f7d488')"
+              in tail_fn)
+        check("and the moments it is banded by are kept with the points",
+              "state.liveInsideT.push(s.t);" in page
+              and "state.liveInsideT.shift();" in page
+              and "state.liveInsideT = [];" in page)
+        # The ramp's newest end moves on every sample wherever you are
+        # standing, and nothing brought the colours up to date while that end
+        # was inside a dungeon: recolourRoute() is called from the branch
+        # that handles a sample with a world position, which an interior
+        # sample is not. It rebuilds the surface tail on the way past and
+        # ends by naming its last run as the one to append to, so the guard
+        # that stops the cave being joined to the line you walked in on has
+        # to be put back after it.
+        inside_branch = page[page.index("if (s.type === 'interior') {"):
+                             page.index("if (s.type !== 'sample') return;")]
+        # Anchored on the whole line rather than on the name: commenting the
+        # call out leaves "// recolourRoute();" behind, which contains the
+        # name and would have kept a dead check green -- the negative test
+        # said so.
+        called = "\n        recolourRoute();\n"
+        check("the ramp keeps moving while you are inside a dungeon",
+              called in inside_branch
+              and inside_branch.rindex("state.liveLayer = null;")
+                  > inside_branch.index(called))
         # It arrives over four hundred milliseconds and used to vanish between
         # one frame and the next, which reads as a glitch rather than as the
         # end of something. On its own canvas, so fading it repaints one line
@@ -3904,8 +4575,7 @@ def main() -> int:
         check("a teleport plays as going from one place to the other",
               "function playTravel(" in page
               and "const PLAY_TRAVEL_MS = 420;" in page
-              and "const wait = kind === 'warp' && e.from ? PLAY_TRAVEL_MS : 0;"
-                  in page
+              and "const wait = departs ? PLAY_TRAVEL_MS : 0;" in page
               and "if (wait) setTimeout(() => { playLand(lasting);" in page)
         check("and a respawn is an event of its own",
               "kind: 'respawn'" in page and "state.respawnList" in
@@ -3946,11 +4616,239 @@ def main() -> int:
         sched = sched[:sched.index("\nasync function reload(")]
         check("a zoom landing on a queued filter change keeps its marks",
               "state.reloadMarks = state.reloadMarks || marks;" in sched)
+        # A grace you keep warping back to is a grace you keep getting up
+        # at, so the teleport mark and the respawn mark land on the same
+        # pixel and one is simply behind the other. Reported as exactly that.
+        # Warping out of a grace you also warp into is the same collision
+        # between two marks of one kind, and it had never been noticed.
+        #
+        # They cannot be merged into one mark: each kind has its own switch
+        # and has to come off the map without taking the others with it. So
+        # they step aside, evenly around the point they share, and a mark
+        # with the spot to itself does not move at all.
+        #
+        # Measured on routes.db: 329 marks on 286 spots, of which 40 are
+        # shared -- 19 warp-out over warp-in, 15 respawn under a teleport,
+        # three of them three deep. Before, 23 pairs on screen sat exactly
+        # on top of each other; after, the closest two icons are 18.7 px
+        # apart, which is one icon's width.
+        # They were nudged apart first, which worked and read as two places
+        # rather than as one place with two things to say. Asked for instead:
+        # "a split symbol, with one symbol on each side. Hovering over it
+        # should show the dashed line for both the teleport and death." So a
+        # shared spot is one marker, a cell per kind, sitting exactly on the
+        # point -- which is the thing a nudge could not do.
+        check("marks that would stand on each other are one mark",
+              "function drawWorldMarks(" in page
+              and "function addSplitMark(spot, group, pane) {" in page
+              # And the world hands its clusters to it. Asserting the
+              # register exists is not the same as asserting it is
+              # used: drawing every mark singly left this green.
+              and "placeMarks(wanted.map(worldCell), deathGroup, 'deaths');"
+                  in page
+              and "if (cells.length === 1) addSingleMark(cells[0]);"
+                  in page
+              and "else addSplitMark({ xy: sp.xy, cells }, splitGroup, splitPane);"
+                  in page
+              and "className: 'split-mark'," in page
+              # The machinery it replaces, gone rather than left unused.
+              # Named exactly, because the word survives in the comment that
+              # explains why it went.
+              and "slotAnchor(" not in page and "slotAt(" not in page
+              and ".split-mark .half {" in sheet)
+        # And it is a disc the size of a single mark. A cell used to be as
+        # wide as the glyph and its count side by side, which made a pair 40
+        # to 52 px and a triple 72 -- a lozenge lying across the terrain
+        # beside marks a third of its size. Reported: "the split markers are
+        # way too wide, they could probably be a circle split down the
+        # middle, with the respective numbers in their corners."
+        #
+        # Two cells of half the height wide are a square box with a radius
+        # bigger than either side, which is a circle; the counts move out to
+        # the corners the single marks already put them in. Measured on
+        # routes.db: every split 24 px, against 40 to 72, and 30 px at its
+        # widest with both counts hanging off it, against 26 for a single
+        # mark carrying one.
+        check("and it is a disc cut down the middle, not a pill",
+              "const SPLIT_CELL = 12;" in page
+              and "const width = SPLIT_CELL * cells.length;" in page
+              and "iconSize: [width, SPLIT_CELL * 2]," in page
+              and "iconAnchor: [width / 2, SPLIT_CELL]," in page
+              # One place says how wide a cell is. The other half of the
+              # shape is the radius, which is larger than either side of a
+              # cell and so is clamped to exactly half of it.
+              and 'style="flex:0 0 ${SPLIT_CELL}px"' in page
+              and "border-radius: 999px 0 0 999px;" in sheet)
+        # Both ends of a jump are one thing at one place. A grace you warp
+        # away from is usually one you warp back to, so the pair landed on a
+        # spot constantly and was drawn as two cells saying the same word
+        # twice -- and with a respawn there as well that made a three-cell
+        # pill where a disc would do. Reported: "if a split marker combines
+        # three different markers, the teleport from, the teleport to, and
+        # the respawn, then make both teleport markers into one, since you
+        # can see where they go to and from by hovering."
+        #
+        # Wherever they meet, not only at three deep: the hover draws every
+        # jump at the spot in both directions either way, and the popup keeps
+        # the two sections it always had.
+        #
+        # Measured on routes.db: the world's splits go 33 to 19 and every one
+        # of them is a pair, with the 14 that were nothing but a jump's two
+        # ends becoming single marks; the castles go 9 splits to 7 and their
+        # three-cell one disappears; the caves keep one three-cell, which is
+        # a teleport, a death and a grace -- three things rather than one
+        # thing twice. And the busiest teleport now wears the number the
+        # panel gives it, 6, where it used to read 4 beside 2.
+        check("and a jump's two ends are one cell, not two",
+              "function mergeFamilies(cells) {" in page
+              and "const cells = mergeFamilies(sp.cells);" in page
+              and "family: m.kind === 'warp' ? 'warp' : null," in page
+              and "xy: c.xy, n: c.list.length, family: 'warp'," in page
+              # The count is every end at the spot; the face is the first
+              # gathered, which is the arrival where there is one.
+              and "into.n += c.n;" in page
+              and "const into = c.family && out.find((o) => o.family === "
+                  "c.family);" in page
+              # What each end was is still in the popup, joined the way a
+              # split joins its sections -- one function for both.
+              and "function popupBox(parts) {" in page
+              and "for (const c of out) if (c.parts) c.popup = popupBox(c.parts);"
+                  in page
+              and "mark.bindPopup(popupBox(cells.map((c) => c.popup)));" in page)
+        check("and its counts are in the corners, not beside the glyphs",
+              '<i class="count">${c.n}</i>' in page
+              and ".split-mark .half .count {" in sheet
+              and ".split-mark .half:first-child .count { left: -4px; }"
+                  in sheet
+              and ".split-mark .half:last-child .count { right: -4px; }"
+                  in sheet
+              # The inline number that made it wide, gone rather than left
+              # to be styled by nothing.
+              and ".split-mark .half b {" not in sheet)
+        # And a spot is a smaller thing than a cluster. Two marks twelve
+        # pixels apart are two 24 px discs overlapping by half -- you can
+        # see there are two of them, and calling that one place said they
+        # were together when they were only near. Reported as "it should
+        # only split if they are directly on top of each other".
+        #
+        # Measured over every cross-kind pair on routes.db: 21 at 0.15 px or
+        # less, then 1.39, 2.1, 2.5, 2.7, 2.8, 2.9, 3.2, 3.9, 4.0, 5.0, 5.4,
+        # 5.7, 7.2 and up with no band to cut at, so the number comes off the
+        # mark rather than the data: a quarter of the disc. 40 splits before,
+        # 33 after, and every one of them a pair -- three deep needs eight
+        # pixels of tolerance and there is none.
+        check("and they only share one when they are on top of each other",
+              "const SPLIT_PX = 6;" in page
+              and "Math.abs(sp.xy[0] - c.xy[0]) < SPLIT_PX" in page
+              and "Math.abs(sp.xy[1] - c.xy[1]) < SPLIT_PX);" in page
+              # Still its own number for two marks of one kind, which is a
+              # different question: that one is a count, not a hiding.
+              and "const CLUSTER_PX = 12;" in page
+              and "px || CLUSTER_PX" in page)
+        # And it answers with everything it stands for. The lines are
+        # gathered and drawn in one call per kind, because showDeathLines()
+        # clears the last set first -- a death cell and a respawn cell each
+        # calling it would leave only the second.
+        check("and it draws every line it has to draw",
+              "function markLines(m) {" in page
+              and "function wireMarkHover(mark, cells) {" in page
+              and "if (deaths.length) showDeathLines(deaths, into, lineRenderer);"
+                  in page
+              and "if (warps.length) showWarpLines(warps, into, lineRenderer);"
+                  in page
+              and "wireMarkHover(mark, cells);" in page
+              and "wireMarkHover(mark, [c]);" in page)
+        # And pressing one keeps them. Asked for: "clicking on a marker
+        # should make the path from one marker to another persist on screen
+        # even when panning." Hung on the popup rather than on the click,
+        # because the popup is already what says which mark you are looking
+        # at: Leaflet opens it on the click, closes it on a map click or on
+        # Escape, swaps it when you press another mark and toggles it when
+        # you press the same one -- so the lines follow all four without a
+        # second set of rules to keep in step.
+        #
+        # While one is pinned a hover does nothing, or a cursor crossing the
+        # map on its way somewhere -- which is what a drag is -- would take
+        # it down or swap it. The dungeon overlay has had that rule since it
+        # was written.
+        redraw_clears = (chr(10) + "  lines.pinned = false;"
+                         + chr(10) + "  hideDeathLines();"
+                         + chr(10) + "  hideWarpLines();")
+        pin_after_draw = ("    lines.pinned = false;" + chr(10)
+                          + "    draw();" + chr(10)
+                          + "    lines.pinned = true;")
+        check("and pressing a mark keeps them up while you pan",
+              "const lines = { pinned: false };" in page
+              and "mark.on('mouseover', () => { if (!lines.pinned) draw(); });"
+                  in page
+              and "if (!lines.pinned) { hideDeathLines(); hideWarpLines(); }"
+                  in page
+              and "mark.on('popupopen', () => {" in page
+              and "mark.on('popupclose', () => {" in page
+              # Drawn afresh and then pinned, so pressing one mark while
+              # another is pinned replaces rather than being refused.
+              and pin_after_draw in page
+              # A mark inside a cave is drawn on a drawing that only exists
+              # while you point at it; pinning the lines without pinning that
+              # would take both away the moment you panned.
+              and "if (into === insideGroup) inside.pinned = true;" in page
+              # And a rebuild of the marks drops it: the mark it was pinned
+              # to may not be among the new ones.
+              and redraw_clears in page)
+        # And a dungeon's own marks go through the same register. They are
+        # drawn by nobody but drawInteriorInto(), so they went on stacking
+        # after the world's were brought together -- reported as "the split
+        # markers don't seem to work in legacy dungeons at least". Measured
+        # on routes.db: 99 marks on the four castles, of which 93 pairs are
+        # within six pixels of each other, 57 of one kind and 36 of two.
+        # After: 76 markers, 5 of them split, and across the 37 caves with
+        # anything in them 305 marks come to 156, 8 of them split.
+        check("and so do the marks inside a dungeon",
+              "placeMarks(cells, group, markPane);" in page
+              and "const home = { group, pane: markPane, lineGroup: group,"
+                  " lineRenderer };" in page
+              # Through the same two rules: one kind at one point is a count,
+              # two kinds at one point is a split.
+              and "for (const c of clusterMarks(acc.fallen, (x) => x.pt)) {"
+                  in page
+              and "for (const c of clusterMarks(acc.got, (x) => x.pt)) {"
+                  in page
+              and "for (const c of clusterMarks(mine, (e) => e.pt)) {" in page
+              # And they say what they stand for when there is more than one
+              # of them, which a mark per death never had to.
+              and "function insideDeathPopup(list, v) {" in page
+              and "function insideWarpPopup(list, which, v) {" in page
+              and "`Died ${n} times here`" in page
+              and "`Arrived here ${n} times`" in page)
+        # One function rather than one per loader, because the answer depends
+        # on all three lists at once -- whichever fetch came back last, the
+        # picture has to be the same. It costs one pass of 9.1 ms, twice on a
+        # reload, against a reload that is already a fetch and a full redraw
+        # of the route.
+        check("and every kind of mark is drawn knowing about the others",
+              "const wanted = [];" in page
+              and "deathGroup.clearLayers();\n  respawnGroup.clearLayers();"
+                  "\n  warpGroup.clearLayers();" in page
+              # Both loaders end in it and nothing else calls it: the two
+              # fetches are the only things that can change the answer.
+              and page.count("  drawWorldMarks();") == 2)
+        # One rule for what counts as one spot, because the register is only
+        # sound while every kind agrees. It was the same loop written out
+        # four times.
+        check("and what counts as one spot is decided in one place",
+              "const CLUSTER_PX = 12;" in page
+              and "function clusterMarks(list, xyOf, px) {" in page
+              # One loop, and a radius it is told: a dungeon's own
+              # metres are not map pixels, and the busiest-spot rows ask
+              # the same question in that space.
+              and "const near_px = px || CLUSTER_PX;" in page
+              and page.count("Math.abs(c.xy[0] - p[0]) < near_px") == 1)
+
         # The teleport marks used to be taken off the map before the request
         # for them was sent, so they were gone for as long as it took -- the
         # same flicker the route was fixed for, on the same gesture.
         warps_js = page[page.index("async function loadWarps("):]
-        warps_js = warps_js[:warps_js.index("\nfunction addWarpMarks(")]
+        warps_js = warps_js[:warps_js.index("\nfunction warpEnds(")]
         check("the teleport marks stay up while they are being refetched",
               "fetch('/api/warps')" in warps_js
               and "\n  warpGroup.clearLayers();" in warps_js
@@ -3989,8 +4887,9 @@ def main() -> int:
         check("going back into a cave carries its tally with it",
               "function playSamePlace(" in page
               and "fa.map_id === fb.map_id" in page
-              and "if (!home && !playSamePlace(play.where, e.where)) return;"
-              in page)
+              and "const arrives = home || playSamePlace(play.where, e.where);"
+              in page
+              and "if (!arrives) return;" in page)
         ent2 = page[page.index("function playEnter("):
                     page.index("function playLine(")]
         check("and the marks of earlier visits are put back with their paths",
@@ -4026,12 +4925,20 @@ def main() -> int:
         # drawings read it. Returning before the fetch left it holding
         # whatever it held before the session filter or the window changed.
         warps_fn = page[page.index("async function loadWarps("):
-                        page.index("\nfunction addWarpMarks(")]
+                        page.index("\nfunction warpEnds(")]
+        # The layer gate moved into warpEnds(), so loadWarps() has no early
+        # return left to put the assignment in front of: it fetches, it
+        # stores, it draws. Asked as "and nothing returns before the store",
+        # which is the property the ordering was standing in for -- and asked
+        # with `in` before any slicing, because `.index()` raises rather than
+        # failing and takes the whole run down with it, which is exactly what
+        # it did when the gate moved.
         check("and the list behind them is kept fresh either way",
               "state.warpList = data.warps.filter(" in warps_fn
+              and "if (!state.warps) return;" not in warps_fn
+              and "if (!state.warps) return null;" in page
               and warps_fn.index("fetch('/api/warps')")
-                  < warps_fn.index("state.warpList = data.warps.filter(")
-                  < warps_fn.index("if (!state.warps) return;"))
+                  < warps_fn.index("state.warpList = data.warps.filter("))
         # The pins are built from the answer already in hand; the frame
         # learning that follows fetches a path per dungeon, and doing that
         # first left the map with no pins on it for the length of two dozen
@@ -4124,7 +5031,7 @@ def main() -> int:
               "'deaths', 'respawns'," in page)
         check("and a permanent drawing's marks go in a pane that dims",
               "opts && opts.permanent ? 'deaths' : 'insideMarks'" in page
-              and "{ permanent: true }" in page,
+              and "permanent: true," in page,
               "still decided from the layer group"
               if "group === placedGroup ? 'deaths'" in page else "")
 
@@ -4163,6 +5070,37 @@ def main() -> int:
         check("and the level either side is fetched while nothing happens",
               "function warmNeighbours(" in page
               and "map.on('moveend zoomend', warmNeighbours)" in page)
+        # The coarse layer is the net under all of that: where the detail
+        # tiles are not in yet, it shows a blurry version of the right place
+        # rather than the container behind the map. It was loaded like any
+        # other tile layer, on demand around wherever you happened to be, so a
+        # pan that outran it showed the background for a frame or two --
+        # reported from the field as exactly that. The whole level is 25
+        # images of a few kB on this map, so it is simply held.
+        #
+        # Measured over eight screen-wide jumps, 80 frames sampled: 0 with a
+        # hole in the coarse layer, against a detail layer down to 32 of its
+        # 45 tiles at its worst.
+        # And under both of them, one image that is never rebuilt. Warming
+        # the cache makes the coarse layer's tiles arrive sooner and cannot
+        # make them always be there: Leaflet creates and prunes them as you
+        # move, so the hole is in the bookkeeping, not the network -- measured
+        # over nine zoom changes, there is a frame where 0 of the detail
+        # layer's 16 tiles are up. An overlay has nothing to prune. The
+        # pyramid's zoom 0 is a single tile with the map in its corner, so
+        # this needs no new asset. Measured after: 72 frames of zooming and
+        # 32 of panning, 0 without it.
+        check("and one image under all of it that is never rebuilt",
+              "function drawNet(" in page
+              and "L.imageOverlay(" in page
+              and "pane: 'tilePane', zIndex: -1" in page
+              # The definition, the first draw, and the other plane's pyramid.
+              and page.count("drawNet(") == 3)
+        check("and the coarse layer under it is held whole",
+              "function warmBase(" in page
+              and "baseHeld = want.slice(0, 200)" in page
+              # At boot, and again when the other plane's pyramid goes up.
+              and page.count("warmBase();") == 2)
 
         # Reported from the field, and all one shape: something the playback
         # draws was being taken away again before it could be seen.
@@ -4200,8 +5138,28 @@ def main() -> int:
         # the other had nothing on the map where you came out.
         check("every mouth of a dungeon gets a pin",
               "function otherMouths(" in page
-              and "for (const mouth of otherMouths(group, door))" in page
-              and ".cave-mark.other-mouth" in sheet)
+              and "for (const mouth of otherMouths(group, doorway, routeDoor, "
+                  "shift))" in page)
+        # Wearing the dungeon's own pin. It was smaller, dashed and faded, on
+        # the reasoning that a door is the lesser of the two things -- and
+        # drawn that way it reads as a different kind of place rather than as
+        # the same one seen from its other side. Reported: "make the exit icon
+        # look the same as the normal one."
+        mouth_css = ""
+        if ".cave-mark.other-mouth" in sheet:
+            mouth_css = sheet[sheet.index(".cave-mark.other-mouth"):][:400]
+        check("and it is the same pin, not a lesser one",
+              "iconSize: [size, size]," in page[page.index(
+                  "for (const mouth of otherMouths("):][:900]
+              and "border-style: dashed" not in mouth_css
+              and "MOUTH_PX" not in page)
+        # And it moves with a drag, because the drag moves the place. The
+        # drawing has been rigid under one since the round that made it so;
+        # the pins beside it should not be the one thing left behind.
+        check("and a drag takes the other mouths with it",
+              "const shift = (group[0].door_xy && group[0].xy)" in page
+              and "for (const m of out) m.xy = [m.xy[0] + move[0], "
+                  "m.xy[1] + move[1]];" in page)
 
         # Room to zoom past the pyramid: what you are looking at that close is
         # the path, which is drawn from the route and stays sharp.
@@ -4350,10 +5308,13 @@ def main() -> int:
         # turn is measured from.
         # Named one by one rather than counted: a count says three lines
         # mention it, not that these three do.
+        # The vote and the pins now go through sameMouth(), which asks inside
+        # first and outside second; the turn pair still asks outside, which is
+        # the space it measures its angle in.
         check("one doorway is one doorway to all three tests that ask",
               "metresApart(k.xy, door) < SAME_DOOR_M" in page       # the turn pair
-              and "metresApart(at(a), at(b)) < SAME_DOOR_M" in page  # the vote
-              and "metresApart(m.xy, v.xy) < SAME_DOOR_M" in page    # the pins
+              and "const mouth = list.filter((b) => sameMouth(a, b));" in page
+              and "const near = out.find((m) => sameMouth(m, c));" in page
               and "Math.hypot(k.xy[0] - v.xy[0]" not in page)
 
         # A knob above the bar and a stem through it. The track, the death
@@ -4452,9 +5413,15 @@ def main() -> int:
               and "inside.timer = null;" in
                   page[page.index("function hideInside("):
                        page.index("function insideHover(")])
+        # Drawn twice: a dark line under the amber one, because a hairline of
+        # amber over painted terrain reads as part of the map. The edge
+        # margin's box is ringed for the same reason; this one is canvas, so
+        # the ring is a second rectangle laid down first rather than a shadow.
         check("and the region is drawn, so you can see where it reaches",
-              "L.rectangle([toLatLng([x0, y0]), toLatLng([x1, y1])], {" in page
-              and "if (inside.box && !inside.pinned) {" in page)
+              "const at = [toLatLng([x0, y0]), toLatLng([x1, y1])];" in page
+              and "if (inside.box && !inside.pinned) {" in page
+              and page.count("L.rectangle(at, {") == 2
+              and "color: '#07100e', weight: 4," in page)
         # A cave's drawing only exists while you are looking at it, and
         # looking at it is the asking -- so its teleports say where they go
         # without a second hover. A legacy dungeon is on the map at all
@@ -4463,7 +5430,44 @@ def main() -> int:
         check("a teleport inside a cave says where it goes without asking",
               "const always = !(opts && opts.permanent);" in page
               and "if (always && pair[0] && pair[1]) {" in page
-              and "if (!always) {" in page)
+              # And on a castle it waits to be asked, which is the same
+              # sentence said the other way round.
+              and "warps: always ? []" in page)
+        # And a death inside one says what it cost you. The world's death
+        # marks have drawn a line to the grace since they were written; the
+        # ones drawn inside a cave or a castle had no hover at all, which is
+        # the same half-fix the teleport marks needed -- the line takes the
+        # group and the renderer, because a mark inside a dungeon is in that
+        # dungeon's own frame and only the caller is holding it. Measured on
+        # routes.db: 32 of the 33 death marks on the castles draw a line and
+        # all 33 clear it, the one that does not being the only death in the
+        # database with no grace at all; and in one catacomb's overlay all
+        # ten marks, five deaths and five graces, draw and clear.
+        check("and a death inside one says what it cost you",
+              "function showDeathLines(pairs, into, lineRenderer) {" in page
+              and "deathHome = into || deathGroup;" in page
+              # Carried by the cell, so a death sharing its spot with a
+              # teleport still draws both.
+              and ".map((x) => ({ from: c.xy, to: x.grace }))," in page
+              and ".map((x) => ({ from: x.from, to: c.xy }))," in page)
+        # Either end of a death line can be somewhere this frame cannot
+        # reach. Out on the surface it is a recorded world position, which is
+        # the same pixels once projected -- the lesson the teleport marks
+        # already taught, where a line was called undrawable for want of a
+        # point that was never made up. Inside *another* dungeon there is no
+        # world position at all, and that dungeon's pin is the one thing on
+        # the map standing for it, which is what warps() does server-side.
+        # On routes.db, of 145 deaths inside a dungeon: 138 graces in the
+        # same place, 2 out on the surface, 4 in another dungeon, 1 with none.
+        check("wherever the other end of it is",
+              "function markEndAt(map_id, local, xy, v, at) {" in page
+              and "if (local && map_id === v.map_id) return at(local[0], "
+                  "local[1]);" in page
+              and "if (local && state.dungeonAt.has(map_id)) "
+                  "return state.dungeonAt.get(map_id);" in page
+              # The whole line, guard included: gating the fill out leaves
+              # the name behind, and the negative test said so.
+              and "    if (v.xy) state.dungeonAt.set(v.map_id, v.xy);" in page)
 
         # Asked for: the dashed box appears while the cursor is on the edge
         # margin slider and not a moment longer. A timer meant a flick past
@@ -4475,6 +5479,26 @@ def main() -> int:
               and "pad.addEventListener('pointerenter', showFollowBox);" in page
               and "if (!padHeld) hideFollowBox();" in page
               and "followBoxTimer" not in page)
+
+        # Walking -- or dying -- out of one dungeon into another takes the
+        # first one's drawing with it. Reported from the field: a Hero's Grave
+        # under a legacy dungeon, a death in it, and the respawn puts you back
+        # in the castle. A castle is world-visible, so refreshLiveInside()
+        # takes the branch that redraws the permanent paths and returns, and
+        # that branch has nothing to say about an overlay because it assumes
+        # there is none -- so the world stayed dimmed and the grave stayed
+        # drawn while the position mark walked around the castle. In the
+        # recording: 15:41 into m35_00, dead at 15:43:20, back in m11_00
+        # thirteen seconds later. Measured after: dimmed 0.18 and 7 layers in
+        # the grave, undimmed and 0 the moment the castle is entered.
+        check("leaving one dungeon for another takes its drawing with it",
+              "hideInside(true);" in
+              page[page.index("async function startLiveInside("):
+                   page.index("function stopLiveInside(")]
+              # And a forced hide happens now rather than on a zero-delay
+              # timer, or the clearing lands after whatever was drawn next.
+              and "if (force) { put(); return; }" in page
+              and "inside.timer = setTimeout(put, 140);" in page)
 
         # Asked for: a way to look at the world without leaving the cave,
         # with moving again as the way back.
@@ -4555,6 +5579,93 @@ def main() -> int:
               and stats_rows.index("'Longest session'")
                   < stats_rows.index("'Sessions'")
                   < stats_rows.index("'Deaths'"))
+
+        # And two rows that are not the server's. Asked for: "a new stat
+        # that's for the most used teleport, and most used respawn, and add a
+        # button that takes you to where that is on the map."
+        #
+        # Counted off the same lists the map draws its marks from, and
+        # clustered at the same radius, so the number in the panel and the
+        # number on the badge are one fact. Which means they are rebuilt
+        # whenever those lists change rather than once at boot, when neither
+        # had arrived.
+        world_marks = ""
+        if "function drawWorldMarks() {" in page:
+            world_marks = page[page.index("function drawWorldMarks() {"):]
+            end = world_marks.find(chr(10) + "function ")
+            world_marks = world_marks[:end] if end > 0 else world_marks
+        check("the busiest teleport and grace are counted like the marks are",
+              "function busiestWarp(" in page
+              and "function busiestRespawn(" in page
+              and "function bestSpot(items) {" in page
+              and "['Most used teleport', `${jump.n}`," in page
+              and "['Most used respawn', `${grace.n}`," in page
+              and "function renderStats() {" in page
+              # And called from drawWorldMarks, which is what runs when
+              # a list changes -- asked of the function rather than of
+              # the file, where buildStats() calls it too.
+              and "renderStats();" in world_marks
+              # Both ends of a jump: a grace you warp away from and come back
+              # to is one teleport used twice. On routes.db the busiest spot
+              # is 4 arrivals and 2 departures, and counting arrivals alone
+              # would have called it a tie between six places used 4 times.
+              and "ends.push({ at: w.local, map_id: w.map_id, which: 'to', w });"
+                  in page
+              and "ends.push({ at: w.from_local, map_id: w.from_map_id, "
+                  "which: 'from', w });" in page
+              # A place used once is not a place you used most.
+              and "return best && best.n > 1 ? best : null;" in page)
+        # In both coordinate spaces, because the answer lives in both: on
+        # routes.db the busiest jump end is a grace in Limgrave with six ends
+        # on it, and the busiest respawn is 31 deep inside a catacomb against
+        # 7 for the busiest anywhere on the surface. Counting only what has a
+        # world position would have named the wrong place.
+        #
+        # A dungeon's frame is a turn and a shift, never a stretch, so
+        # CLUSTER_PX / scale asks the same question in local metres that the
+        # drawing asks in pixels. Measured over all 31 dungeons with a
+        # respawn in them: the panel's count and the drawn badge agree on
+        # every one.
+        check("and inside a dungeon as well as out on the map",
+              "function localClusterPx() {" in page
+              and "return CLUSTER_PX / (Math.abs(pr.scale_x) || 1);" in page
+              and "keep(clusterMarks(list, (i) => i.at, localClusterPx()), "
+                  "map_id);" in page
+              and "if (r.layer === 'interior' && r.local) {" in page)
+        # And the button goes there. A world spot needs only the view; one
+        # inside a dungeon has no world position at all, so the place is
+        # drawn first and the point read back through the frame it is drawn
+        # in -- then the mark's own popup is opened, because a screen of
+        # discs with no way to tell which one was meant is not an answer.
+        check("and pressing the number takes you to it",
+              "async function goToSpot(spot) {" in page
+              and "map.setView(toLatLng(spot.at), zoom, { animate: false });"
+                  in page
+              and "await showInside(visits, true);" in page
+              and "const at = tf.at(spot.at[0], spot.at[1]);" in page
+              and "function openMarkAt(xy, groups) {" in page
+              and "found.openPopup();" in page
+              and ".stats .stat-go {" in sheet)
+        # The marks of a drawing are gathered across every visit in it, not
+        # per visit: a place you went back to is one place. A grace you got
+        # up at 21 times over nine visits was nine marks on one pixel, each
+        # counting its own visit -- the busiest showing 9 while the panel,
+        # which counts the place, said 21. Measured on the four castles:
+        # 76 markers per visit, 63 per place.
+        check("and a place you went back to is one place, not one a visit",
+              "function insideAccumulator() {" in page
+              and "function placeInsideMarks(acc, v, group, markPane, "
+                  "lineRenderer, always) {" in page
+              and "const acc = (opts && opts.marks) || insideAccumulator();"
+                  in page
+              # Both drawings gather: the castles drawn in the open, one
+              # accumulator per dungeon, and the overlay a hover puts up.
+              and "placeInsideMarks(g.marks, g.v, g.layer, 'deaths', "
+                  "renderer, false);" in page
+              and "placeInsideMarks(marks, v, insideGroup, 'insideMarks', "
+                  "insideRenderer, true);" in page
+              # And a drawing of one visit still places its own.
+              and "if (!(opts && opts.marks)) {" in page)
 
         # Sessions: show fewer at any point, not only once every one of them
         # is on screen -- and a row says how long you played rather than how

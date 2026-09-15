@@ -26,7 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tracker.store import Store  # noqa: E402
+from tracker.store import Store, kept_a_copy  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -75,6 +75,7 @@ def main() -> int:
         store.close()
         return 0
 
+    kept_a_copy(store, "breaks")
     ids = [r["id"] for r in rows]
     for i in range(0, len(ids), 400):
         chunk = ids[i:i + 400]

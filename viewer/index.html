@@ -7,7 +7,7 @@
      controls this page declares. Bumped together whenever a control is added,
      so a browser holding one and not the other says so instead of dying on
      the first missing element. -->
-<meta name="page-build" content="66">
+<meta name="page-build" content="69">
 <title>Tarnished Path</title>
 <link rel="stylesheet" href="vendor/leaflet.css">
 <link rel="stylesheet" href="style.css">
@@ -90,6 +90,35 @@
      Roundtable Hold has no way in on foot at all. Opens the inset without
      moving the map, during playback as well. -->
 <div id="offmap" hidden></div>
+
+<!-- Your sessions, while the playback is running. The panel has this
+     list already, but during a playback it is three sections down a
+     column you have to scroll -- and the one thing you want while
+     watching is "play that evening instead". So it comes to the map,
+     with what does not belong here taken off: no checkboxes, since what
+     is drawn is the playback's business now, and no delete, which is not
+     a thing to press by accident while watching. The row is the button.
+     Foldable, and it remembers which way you left it. -->
+<div id="play-sessions" hidden>
+  <button id="ps-head" aria-expanded="true"
+          title="Fold this away">Sessions</button>
+  <div id="ps-body">
+    <!-- Where the playhead is, which is a different question from what
+         the two grips are around: you can trim to one evening, or leave
+         the window open and drift through several. -->
+    <p class="ps-cap">Current session displayed</p>
+    <div id="ps-now"></div>
+    <!-- Only when there is something to undo: with the grips at the ends
+         already, a button offering to put them there says nothing. -->
+    <button id="ps-all" class="ghost" hidden>Play the whole route</button>
+    <p class="ps-cap">Every session</p>
+    <div id="ps-list"></div>
+    <div class="row-buttons">
+      <button id="ps-more" class="ghost" hidden></button>
+      <button id="ps-fewer" class="ghost" hidden>Fewer</button>
+    </div>
+  </div>
+</div>
 
 <div id="timeline" hidden>
   <div class="play-track">

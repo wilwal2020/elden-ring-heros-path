@@ -67,7 +67,7 @@ once.
 ## Install
 
 ```bash
-pip install -r requirements.txt
+pip install -r tools/requirements.txt
 ```
 
 Windows needs `pymem` for live capture (it's in the requirements file, guarded
@@ -405,7 +405,7 @@ route and the marks together.
 Build the second pyramid the same way as the first:
 
 ```bash
-python tools/make_tiles.py m1-underground.png --out viewer/tiles-underground
+python tools/make_tiles.py assets/m1-underground.png --out viewer/tiles-underground
 ```
 
 then restart the recorder -- the button only appears once the tiles are on
@@ -581,9 +581,14 @@ at the end, the whole path showed its final colours from the first frame,
 which gave away how much of the route was still to come.
 
 Walking back into a cave shows the cave, not just the run you are on: the
-earlier visits' paths are drawn faintly underneath and their deaths and
+earlier visits' paths are drawn underneath and their deaths and
 teleports are put back, so the count on a mark carries on from where it was
 rather than starting again.
+
+A teleport that lands inside a dungeon is marked where it actually put you
+rather than at the way in, the same as on the finished map, and the line
+across is drawn from the place you left -- which for a jump out of a cave is
+that cave's own pin once the playback has walked back out of it.
 
 A cave dims the world to show itself, because it is under the terrain and
 there is nowhere else to draw it. A legacy dungeon does not: it is on the map
@@ -705,6 +710,15 @@ world position, the third from a dungeon's own metres. Then time recorded,
 the average and longest session, deaths and deaths an hour, teleports, caves
 and dungeons entered, legacy dungeons, and sessions.
 
+Two of the rows are places rather than totals: **Most used teleport** and
+**Most used respawn**, the spot you went through most and the grace you got up
+at most. The number is a button -- press it and the map goes there and opens
+that mark's own popup, which lists the times. Where the place is inside a
+dungeon the dungeon is drawn first, so the answer is the mark on its path
+rather than a pin at its door. Both ends of a jump count towards a teleport: a
+grace you warp away from and come back to is one teleport you used twice. A
+spot used only once is not listed at all.
+
 Three things it does deliberately. Distance skips every teleport, since a warp
 is not ground you covered. Time recorded caps each gap at ten seconds, so it
 means time played rather than time the recorder was left running -- and the
@@ -783,8 +797,8 @@ panel says so rather than showing a black screen.
 | **▲** | A cave, catacomb or tunnel -- one mark per place however often you go back, with a count when you have. The pin's tip is the entrance, and it grows with the time you have spent inside. Hover to see the path in there, or click for a popup with a **Show path** button per visit |
 | **♜** | A legacy dungeon or Divine Tower, draggable if it is in the wrong place. Same behaviour, paler, and every path through it is on the map at all times rather than only on hover |
 | **✕** | You died. A number means you died there more than once, and the popup lists when |
-| **✦** | You arrived here by teleport |
-| **✧** | You left from here by teleport -- the dimmer twin of the mark above. Hover either end to draw the jump between them |
+| **✦** | You arrived here by teleport. Where you have both arrived at and left from one spot, the two are one mark counting every use of it -- the popup says which were which, and hovering draws them all |
+| **✧** | You left from here by teleport -- the dimmer twin of the mark above. Hover either end to draw the jump between them: the dashes run the way you went, from where you left towards where you arrived. Click it and the line stays up while you pan around -- press the map, press Escape, or press the mark again to put it away |
 | **✹** | Where you respawned afterwards, in the amber of a grace |
 |  | Hover either mark and the line between them shows what dying cost you |
 | **◉** | Where you are now, while the recorder is running |
@@ -812,6 +826,20 @@ cluster into one mark with a count, and so do respawns -- five deaths to the
 same boss is one mark and one grace, both reading 5. Die inside a castle and
 the grace is usually in there too, so both marks are drawn on that castle's
 own path rather than piled on its entrance.
+
+Two *different* kinds of mark standing on the same spot become one disc cut
+down the middle, a half each, rather than one sitting behind the other -- a
+grace you warp back to is usually a grace you get up at, so a teleport and a
+respawn often land on the same pixel. Each half keeps its own symbol and its
+own colour, with its count in the corner on its side, and the mark stands on
+the spot itself. Hovering it draws every line it stands for at once: the jump
+to the far end and the line from the death to the grace. Untick one of the
+kinds and that half comes out, leaving the rest of the mark where it was.
+Marks that are merely near each other are left as they are -- they only share
+a disc when one would be hiding the other. The same goes for the marks drawn
+inside a dungeon, on its own path: several of one kind at one spot are one
+mark with a count, and two kinds at one spot are one mark divided between
+them, exactly as out on the map.
 
 A death inside a cave is drawn the same way, on that cave's own path, and the
 count on the cave's pin is the other half of it. It is deliberately not also
@@ -972,8 +1000,19 @@ route can work out -- there is no way in on foot, so nothing recorded says
 where it is. It appears under *Interiors with no place on the map*, with
 **Show path** to draw it in the inset and **Put on map** if you know where it
 belongs: click that, then click the spot, and it stays there. Escape cancels.
-A position set that way outranks everything the tracker infers, and the marker
-can be dragged afterwards like any other.
+A position set that way stands until the recording can do better: walk in
+through a door and the doorway it measures takes over, because a drag is a
+guess at where a place is and the step across its threshold is not. The
+marker can be dragged afterwards like any other.
+
+Which places still need one:
+
+```
+python tools/places.py
+```
+
+lists every place the recording has been inside, how each one is placed, and
+which have no position on the map at all.
 
 The Hold ships placed in the bottom-left corner, which is where the game's own
 map screen shows it.
@@ -982,8 +1021,8 @@ map screen shows it.
 noticed that being unable to read the game is itself a load screen. It cannot
 happen again, but an anchor already recorded stays until something outvotes
 it: from the third visit to that place the odd one out loses automatically,
-and until then dragging its marker fixes it for good -- a position set by hand
-outranks everything.
+and until then dragging its marker fixes it -- and walking in through the
+door fixes it for good.
 
 **A dungeon is drawn in the wrong place** -- if you got there through a
 transporter trap, this is now handled: the chest is not treated as the
@@ -991,8 +1030,10 @@ dungeon's door, and the dungeon is placed where you walked out instead. Old
 routes imported from the Nexus tool are corrected too, the first time the same
 trap is recorded live. If something is still wrong -- a place you only ever
 warped into and warped out of has nothing to be placed by -- drag its marker
-to where it belongs. A position set by hand outranks everything worked out
-from the route.
+to where it belongs. A position set by hand outranks everything the route
+*infers*; the one thing it does not outrank is a doorway the route actually
+walked through, since that is a measurement and the drag was a guess at the
+same thing.
 
 **A straight line through the rock inside a cave**, with no teleport mark on
 it, is a lift or a teleporter recorded before the tracker could see inside a

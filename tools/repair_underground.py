@@ -10,8 +10,9 @@ which is what a session recorded in Siofra looks like on the surface map.
 Nothing is lost in that: the local coordinates were always recorded. This
 pass reclassifies those rows and fills in the world position from the origin
 in `[maps.area_origin]`, so an existing route appears on the underground map
-without being walked again. Run it whenever a new origin is added: the maps
-it could not place before become placeable the moment there is one.
+without being walked again. Run it whenever an origin is added or corrected:
+a map it could not place before becomes placeable the moment there is one, and
+a map recorded under the wrong origin is moved to the right one.
 
     python tools/repair_underground.py            # say what would change
     python tools/repair_underground.py --write    # change it
@@ -20,7 +21,7 @@ it could not place before become placeable the moment there is one.
 from __future__ import annotations
 
 import argparse
-import sqlite3
+import math
 import sys
 from pathlib import Path
 
@@ -29,6 +30,7 @@ sys.path.insert(0, str(ROOT))
 
 from tracker.coords import MapConfig, MapId, UNDERGROUND  # noqa: E402
 from tracker.main import load_config  # noqa: E402
+from tracker.store import Store, kept_a_copy  # noqa: E402
 
 
 def main() -> int:
@@ -45,12 +47,12 @@ def main() -> int:
         print("no underground_areas configured; nothing to do")
         return 0
 
-    db = sqlite3.connect(a.db)
-    db.row_factory = sqlite3.Row
+    store = Store(a.db)
+    db = store.db
 
     areas = ",".join(str(int(x)) for x in sorted(maps.underground_areas))
     rows = db.execute(
-        f"SELECT id, map_id, layer, x, z, wx FROM samples "
+        f"SELECT id, map_id, layer, x, z, wx, wz FROM samples "
         f"WHERE ((map_id >> 24) & 255) IN ({areas})"
     ).fetchall()
     if not rows:
@@ -59,6 +61,7 @@ def main() -> int:
 
     placed: dict[int, int] = {}
     unplaced: dict[int, int] = {}
+    moved: dict[int, float] = {}
     relayered = 0
     updates = []
     for r in rows:
@@ -71,7 +74,20 @@ def main() -> int:
         if r["layer"] != UNDERGROUND:
             relayered += 1
         wx, wz = (world if world else (None, None))
-        if r["layer"] != UNDERGROUND or (wx is not None and r["wx"] is None):
+        # The config is what says where an underground map sits, so a row
+        # whose world position is not the one the config now computes is
+        # out of date -- whether it was never placed, or placed at an
+        # origin that has since been corrected. Rewriting only the
+        # never-placed rows meant that adding [maps.map_origin] for a map
+        # already recorded under its area's origin changed nothing at
+        # all: every row kept the wrong position it was written with, and
+        # the pass reported "0 rows change" for a map drawn 4 km out.
+        # Compared exactly, because both sides are the same sum of the
+        # same two doubles -- an unchanged origin cannot differ in a bit.
+        stale = (wx != r["wx"])
+        if stale and wx is not None and r["wx"] is not None:
+            moved[r["map_id"]] = math.dist((wx, wz), (r["wx"], r["wz"]))
+        if r["layer"] != UNDERGROUND or stale:
             updates.append((UNDERGROUND, wx, wz, r["id"]))
 
     for map_id, n in sorted(placed.items()):
@@ -79,6 +95,10 @@ def main() -> int:
         origin = maps.underground_origin(m)
         print(f"  {m}: {n} samples placed at "
               f"({origin[0]:.2f}, {origin[1]:.2f})")
+    for map_id, d in sorted(moved.items()):
+        m = MapId.unpack(map_id)
+        print(f"  {m}: moves {d:.0f} m to the origin now configured "
+              f"for it")
     for map_id, n in sorted(unplaced.items()):
         m = MapId.unpack(map_id)
         print(f"  {m}: {n} samples have no origin, so they stay off the "
@@ -101,6 +121,7 @@ def main() -> int:
         print("\nnothing written. Pass --write to apply.")
         return 0
 
+    kept_a_copy(store, "underground")
     db.executemany(
         "UPDATE samples SET layer = ?, wx = ?, wz = ? WHERE id = ?", updates
     )

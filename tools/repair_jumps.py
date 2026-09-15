@@ -77,7 +77,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from tracker.coords import MapId  # noqa: E402
-from tracker.store import BREAK_RELOAD, BREAK_SPEED, Store  # noqa: E402
+from tracker.store import BREAK_RELOAD, BREAK_SPEED, Store, kept_a_copy  # noqa: E402
 
 # In the empty band the data leaves between walking and riding a lift.
 DEFAULT_MAX_MPS = 15.0
@@ -466,6 +466,7 @@ def main() -> int:
                   f"{str(MapId.unpack(g['map_id'])):<16}{g['samples']:>8}"
                   f"{g['seconds']:>8.1f}s{at:>22}{back:>22}")
         if a.ghosts and a.write:
+            kept_a_copy(store, "ghosts")
             n = sum(store.drop_ghost_stay(g) for g in ghosts)
             print(f"\n  {n} reading(s) put back where you were standing. The "
                   f"visit and its marker\n  are gone, and any death filed on "
@@ -494,6 +495,7 @@ def main() -> int:
             print(f"  {t:%Y-%m-%d %H:%M:%S}    {nxt:%H:%M:%S}"
                   f"{shown:>18}")
         if a.graces and a.write:
+            kept_a_copy(store, "graces")
             for g in lost:
                 store.claim_grace(g["ts_ms"], g["sample_id"])
             print(f"\n  put right. Each grace is now the point after the "
@@ -615,6 +617,7 @@ def main() -> int:
         store.close()
         return 0
 
+    kept_a_copy(store, "jumps")
     # A jump that was too fast is a speed break; a hole in the recording is
     # what a load screen looks like from here, which is break code 3.
     by_code: dict = {}

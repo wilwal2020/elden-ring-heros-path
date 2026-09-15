@@ -28,11 +28,11 @@ if errorlevel 1 (
 if errorlevel 1 (
     echo Some of what this needs is not installed yet. Installing it now.
     echo.
-    %PY% -m pip install -r requirements.txt
+    %PY% -m pip install -r tools\requirements.txt
     if errorlevel 1 (
         echo.
         echo That did not work. Run this by hand to see why:
-        echo     %PY% -m pip install -r requirements.txt
+        echo     %PY% -m pip install -r tools\requirements.txt
         echo.
         pause
         exit /b 1

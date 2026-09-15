@@ -26,7 +26,7 @@ VIEWER_DIR = Path(__file__).resolve().parent.parent / "viewer"
 # old server: endpoints it has never heard of 404 loudly, but a field it does
 # not send yet fails silently, and the feature simply does not appear. The
 # viewer checks this number and says which half is out of date.
-API_VERSION = 17
+API_VERSION = 28
 
 
 def tile_pyramid_extent(zoom: int, which: str = "tiles") -> Optional[tuple[int, int]]:
@@ -162,6 +162,11 @@ class Server:
         self.store = store
         self.cfg = cfg
         self.maps = MapConfig(cfg)
+        # Positions that came with the tool. Handed over here because the
+        # store has no MapConfig and this is the one place that holds
+        # both -- and it covers `record` as well as `serve`, since the
+        # recorder serves the same viewer.
+        self.store.shipped = dict(self.maps.map_places)
         self.proj = Projection(cfg)
         self.host = host
         self.port = port
@@ -190,15 +195,14 @@ class Server:
             web.delete("/api/session/{sid}", self.delete_session),
             web.post("/api/place", self.place),
             web.post("/api/death", self.death),
+            web.post("/api/grace", self.grace),
             web.post("/api/name", self.name),
             web.get("/api/stats", self.stats),
             web.post("/api/standdown", self.standdown),
             web.get("/ws", self.ws),
         ]
         if (VIEWER_DIR / "tiles").exists():
-            routes.append(
-                web.static("/tiles", str(VIEWER_DIR / "tiles"), show_index=False)
-            )
+            routes.append(web.get("/tiles/{tail:.*}", self.tile))
         else:
             routes.append(web.get("/tiles/{tail:.*}", self.no_tiles))
         # Catch-all last so it can't shadow the routes above.
@@ -212,7 +216,7 @@ class Server:
     # wireControls() throws on the first missing control, and boot() dies
     # before it ever draws a route -- a blank map with dead buttons, from a
     # change that works everywhere it is tested with a cache-buster. The
-    # tiles are still cached: they are large and never change.
+    # tiles go the other way and say so explicitly -- see TILE_CACHE below.
     NO_STORE = {"Cache-Control": "no-store, must-revalidate"}
 
     async def index(self, request):
@@ -225,6 +229,25 @@ class Server:
         if not path.is_file():
             return web.Response(status=404, text=f"no {name} in viewer/")
         return web.FileResponse(path, headers=self.NO_STORE)
+
+    # A day, which is long enough that a session never pays for the same tile
+    # twice and short enough that rebuilding the pyramid shows up the next
+    # time you sit down. Without any directive at all a browser falls back to
+    # heuristic caching -- it does keep them, but it revalidates, and every
+    # page load starts cold. Measured on the first visit to a zoom level with
+    # nothing cached: 6 to 26 per cent of the screen has no tile for 45 to
+    # 61 ms, which is the blur-then-snap that reads as a flicker.
+    TILE_CACHE = {"Cache-Control": "public, max-age=86400"}
+
+    async def tile(self, request):
+        tail = request.match_info["tail"]
+        path = (VIEWER_DIR / "tiles" / tail).resolve()
+        root = (VIEWER_DIR / "tiles").resolve()
+        # A tile path comes from the URL, so it has to be kept under the tile
+        # directory rather than trusted.
+        if root not in path.parents or not path.is_file():
+            return web.Response(status=404, text="no such tile")
+        return web.FileResponse(path, headers=self.TILE_CACHE)
 
     async def no_tiles(self, request):
         return web.Response(status=404, text="no tiles generated yet")
@@ -267,15 +290,28 @@ class Server:
         segments: list[dict] = []
         current: list[tuple] = []
         current_layer = None
+        # A session boundary ends a segment too. Samples are ordered by time
+        # across every session, so two that overlap -- an import covering an
+        # afternoon a live session also covers -- would be interleaved into
+        # one line zig-zagging between them. Nothing in routes.db overlaps
+        # today, and the first sample of a session carries a break anyway;
+        # this is so that neither has to stay true.
+        current_session = None
         for r in self.store.iter_samples(layers, session_ids, t0, t1):
-            if r["break_before"] or r["layer"] != current_layer:
+            if (r["break_before"] or r["layer"] != current_layer
+                    or r["session_id"] != current_session):
                 if len(current) > 1:
-                    segments.append({"layer": current_layer, "points": current})
+                    segments.append({"layer": current_layer,
+                                     "session": current_session,
+                                     "points": current})
                 current = []
                 current_layer = r["layer"]
+                current_session = r["session_id"]
             current.append((r["wx"], r["wz"], r["y"], r["ts_ms"]))
         if len(current) > 1:
-            segments.append({"layer": current_layer, "points": current})
+            segments.append({"layer": current_layer,
+                             "session": current_session,
+                             "points": current})
 
         out = []
         total_in = total_out = 0
@@ -294,6 +330,7 @@ class Server:
             out.append(
                 {
                     "layer": seg["layer"],
+                    "session": seg.get("session"),
                     "xy": coords,
                     "h": [round(p[2], 1) for p in pts],
                     "t": [p[3] for p in pts],
@@ -314,6 +351,8 @@ class Server:
         """
         out = []
         unplaced = []
+        extents = self.store.dungeon_extents()
+        bases = self.store.place_bases()
         for v in self.store.interior_visits():
             m = MapId.unpack(v["map_id"])
             if v["layer"] not in ("interior", "unknown"):
@@ -328,11 +367,28 @@ class Server:
                         "left_ms": (v["entered_ms"] + v["duration_ms"]
                                     if v["duration_ms"] is not None else None),
                         "duration_ms": v["duration_ms"],
-                        "placed": "unknown",
+                        # Two different answers, and the viewer acts on the
+                        # difference: `nowhere` is something you have said,
+                        # `unknown` is a question nothing could answer.
+                        # Passed through rather than always "unknown", which
+                        # threw away what interior_visits() had just worked
+                        # out.
+                        "placed": ("nowhere" if v["placed"] == "nowhere"
+                                   else "unknown"),
+                        # And this one is not an answer at all, it is the
+                        # question being withdrawn: a place the game itself
+                        # puts nowhere is not somewhere you can correct, so
+                        # the viewer offers it no way to try.
+                        "fixed": self.maps.is_nowhere(m),
                     }
                 )
                 continue
             x, y = self.proj.apply(v["wx"], v["wz"])
+            # Where the route put the doorway, for a dungeon you have placed
+            # yourself. Projected the same way, because the viewer works in
+            # map pixels and cannot do it.
+            door = (v.get("door_wx"), v.get("door_wz"))
+            door = door if door[0] is not None else None
             out.append(
                 {
                     # The plane its entrance is on: a cave off Limgrave is
@@ -357,11 +413,64 @@ class Server:
                     # Legacy dungeons are drawn on the map at all times; caves
                     # only when you ask for them.
                     "world_visible": self.maps.is_world_visible(m),
+                    # How big the place is, in its own metres -- which is what
+                    # says whether a second anchor can be a second mouth. Two
+                    # mouths of one dungeon cannot be further apart than the
+                    # dungeon is.
+                    "extent_m": round(extents.get(v["map_id"], 0.0), 1),
+                    # And where the route thought the doorway was, when the
+                    # position above is one you gave by hand. That one is what
+                    # everything is drawn *at*; this is what the frame is
+                    # pinned *by*, so dragging the pin moves the drawing
+                    # exactly as far as the pin and no further.
+                    **({"door_xy": [round(c, 2)
+                                    for c in self.proj.apply(*door)],
+                        "door_placed": v["door_placed"]} if door else {}),
+                    # Which point inside this place the drag put at the
+                    # position above. A whole frame, so nothing the route
+                    # learns later can move the drawing off it.
+                    **({"hand_local": [round(c, 2) for c in bases[
+                        v["map_id"]]]} if v["map_id"] in bases else {}),
+                    # Where this visit's own way in put you, inside. Two
+                    # readings of one doorway land in the same place inside
+                    # however far apart they are on the surface, and two real
+                    # mouths do not -- which is the only test that tells them
+                    # apart. See interior_visits().
+                    **({"first_local": [round(v["first_x"], 2),
+                                        round(v["first_z"], 2)]}
+                       if v.get("first_x") is not None else {}),
+                    # And the way out, when it was walked: the surface
+                    # position you came back at, with the last step inside
+                    # that led to it. This is the far mouth of a cave walked
+                    # through, which nothing has ever had a pin for.
+                    **({"exit_xy": [round(c, 2) for c in
+                                    self.proj.apply(v["exit_wx"],
+                                                    v["exit_wz"])],
+                        "exit_local": [round(v["exit_x"], 2),
+                                       round(v["exit_z"], 2)]}
+                       if v.get("exit_wx") is not None else {}),
                 }
             )
         return web.json_response({"visits": out, "unplaced": unplaced})
 
-    def _respawn_item(self, d: dict):
+    @staticmethod
+    def _plane_of(layer: str, map_id: int, planes: dict) -> str:
+        """Which map a mark is drawn on.
+
+        `layer` says what kind of place it happened in -- surface,
+        underground, or the inside of something -- and the viewer files marks
+        by which of the two maps they belong to, which is a different
+        question for an interior. A cave opening off Siofra is drawn on the
+        underground; its own layer says only "interior", which the viewer
+        read as the Lands Between. 58 of the 138 deaths in routes.db carry
+        that layer, and they are all right today only because every dungeon
+        in it opens off the surface.
+        """
+        if layer == "interior":
+            return planes.get(map_id, "surface")
+        return layer if layer == "underground" else "surface"
+
+    def _respawn_item(self, d: dict, planes: dict):
         """Where you got up, in the same shape as the death itself.
 
         None when there was no load screen to read it from, and None again
@@ -378,6 +487,7 @@ class Server:
             "map_id": r["map_id"],
             "label": self._label(m),
             "layer": r["layer"],
+            "plane": self._plane_of(r["layer"], r["map_id"], planes),
             "ts": r["ts_ms"],
             "after_s": r["after_s"],
             "local": ([r["local_x"], r["local_z"]]
@@ -397,6 +507,7 @@ class Server:
         it really happened.
         """
         out = []
+        planes = self.store.map_planes()
         for d in self.store.deaths():
             m = MapId.unpack(d["map_id"])
             # A death with no anchor is still a death. It has nowhere to go on
@@ -415,13 +526,18 @@ class Server:
                     "map_id": d["map_id"],
                     "label": self._label(m),
                     "layer": d["layer"],
+                    "plane": self._plane_of(d["layer"], d["map_id"], planes),
                     "ts": d["ts_ms"],
                     # Where it happened in the dungeon's own metres, when that
                     # was recorded: the entrance anchor above is only where
                     # the mark sits until the dungeon itself is drawn.
                     "local": ([d["local_x"], d["local_z"]]
                               if d["local_x"] is not None else None),
-                    "respawn": self._respawn_item(d),
+                    "respawn": self._respawn_item(d, planes),
+                    # Whether the grace on this death was corrected by hand,
+                    # so the mark can offer to put it back rather than
+                    # offering both directions at once.
+                    "grace_step": d.get("grace_step", 0),
                 }
             )
         return web.json_response({"deaths": out})
@@ -429,12 +545,19 @@ class Server:
     async def warps(self, request):
         """Both ends of every jump the line refused to draw."""
         out = []
+        planes = self.store.map_planes()
         for w in self.store.warps():
             item = {
                 "map": str(MapId.unpack(w["map_id"])),
                 "map_id": w["map_id"],
                 "from_map": str(MapId.unpack(w["from_map"])),
                 "ts": w["ts_ms"],
+                # Where the jump left from, not only how long ago. Marking a
+                # jump as a death needs the sample it set off from, and for a
+                # transit -- a jump across a whole dungeon stay -- that is not
+                # the row before the arrival: the death landed on the last
+                # step inside the dungeon instead of on the surface outside.
+                "from_ts": w["from_ts"],
                 "gap_s": round((w["ts_ms"] - w["from_ts"]) / 1000, 1),
                 "distance_m": round(w["distance_m"]),
                 "reason": {1: "the map changed",
@@ -448,18 +571,29 @@ class Server:
                 # where it was drawn in the middle of Limgrave and nowhere at
                 # all on the map you were standing on.
                 "layer": w["layer"],
+                "plane": self._plane_of(w["layer"], w["map_id"], planes),
             }
-            if w["inside"]:
-                # A lift or a teleporter within one dungeon: local metres, to
-                # be drawn on that dungeon's own drawing.
-                item["local"] = [round(w["x"], 2), round(w["z"], 2)]
-                item["from_local"] = [round(w["from_x"], 2),
-                                      round(w["from_z"], 2)]
-            else:
+            if not w["inside"]:
                 to_x, to_y = self.proj.apply(w["wx"], w["wz"])
                 from_x, from_y = self.proj.apply(w["from_wx"], w["from_wz"])
                 item["xy"] = [round(to_x, 2), round(to_y, 2)]
                 item["from_xy"] = [round(from_x, 2), round(from_y, 2)]
+            # An end inside a dungeon knows exactly where it is -- in that
+            # dungeon's metres. The `xy` above stands it at the pin because
+            # the world map has nowhere better, and that is the right answer
+            # from outside; it is the wrong one the moment the place itself
+            # is on the screen. Sent for both ends of a lift inside one
+            # dungeon, as it always was, and now for the one end of a gate
+            # off the surface as well -- 20 of the 111 jumps on routes.db,
+            # 13 of them into or out of a castle drawn in the open.
+            if w.get("to_inside") and w.get("x") is not None:
+                item["local"] = [round(w["x"], 2), round(w["z"], 2)]
+            if w.get("from_inside") and w.get("from_x") is not None:
+                item["from_local"] = [round(w["from_x"], 2),
+                                      round(w["from_z"], 2)]
+            # Which dungeon the departure end is in, so the viewer can match
+            # it to a visit the way it matches the arrival by `map_id`.
+            item["from_map_id"] = w["from_map"]
             out.append(item)
         return web.json_response({"warps": out})
 
@@ -579,7 +713,16 @@ class Server:
             return web.json_response(
                 {"ok": False, "error": "wx and wz must be numbers"}, status=400
             )
-        self.store.set_place(map_id, wx, wz)
+        # The point inside the place that the drag put at that position:
+        # without it the placement means "put whatever the route calls
+        # the doorway here", and the route can learn a better doorway
+        # afterwards and take the whole drawing with it.
+        local = body.get("local")
+        try:
+            base = (float(local[0]), float(local[1])) if local else None
+        except Exception:
+            base = None
+        self.store.set_place(map_id, wx, wz, base)
         return web.json_response({"ok": True, "map_id": map_id,
                                   "wx": wx, "wz": wz})
 
@@ -645,13 +788,57 @@ class Server:
                     status=404)
             return web.json_response({"ok": True, **placed})
 
-        placed = self.store.mark_death(ts)
+        # The jump's own departure, when the viewer knows it. A transit's
+        # departure is not the row before its arrival -- it is the surface
+        # sample before the whole dungeon stay -- so without this the death
+        # landed on the last step inside the dungeon.
+        try:
+            came_from = int(body["from_ts"]) if body.get("from_ts") else None
+        except (ValueError, TypeError):
+            came_from = None
+        placed = self.store.mark_death(ts, came_from)
         if placed is None:
             return web.json_response(
                 {"ok": False,
                  "error": f"no jump arriving at {ts} in this database"},
                 status=404)
         return web.json_response({"ok": True, **placed})
+
+    async def grace(self, request):
+        """Say the grace for a death is further along than the rule thinks.
+
+        The rule takes the first load screen after the death, which is right
+        almost always and cannot be right every time: reported from the
+        field, a death at 17:27:06 whose next load screen at 17:27:21 is
+        still in the room you died in, with the place the game actually put
+        you at 17:27:26 carrying a map change -- which the rule refuses, for
+        a reason that is itself measured. Nothing in the recording separates
+        those, so this asks.
+
+        `ts` is the death. `step` is how many stored samples past the rule's
+        answer to go; 0 puts it back.
+        """
+        try:
+            body = await request.json()
+            ts = int(body["ts"])
+            step = int(body.get("step", 1))
+        except (KeyError, ValueError, TypeError, json.JSONDecodeError):
+            return web.json_response(
+                {"ok": False, "error": "need the death's time as 'ts'"},
+                status=400)
+        if not self.store.step_grace(ts, step):
+            return web.json_response(
+                {"ok": False, "error": f"no death recorded at {ts}"},
+                status=404)
+        # The answer, so the viewer can say where it landed rather than
+        # having to refetch everything to find out.
+        found = next((d for d in self.store.deaths() if d["ts_ms"] == ts), None)
+        return web.json_response({
+            "ok": True,
+            "step": max(0, step),
+            "respawn": (self._respawn_item(found, self.store.map_planes())
+                        if found else None),
+        })
 
     async def delete_session(self, request):
         """Delete one session and everything recorded under it."""

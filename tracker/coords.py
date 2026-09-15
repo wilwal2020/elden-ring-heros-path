@@ -60,6 +60,22 @@ class MapId:
     def __str__(self) -> str:
         return f"m{self.area:02d}_{self.block:02d}_{self.region:02d}_{self.index:02d}"
 
+    @classmethod
+    def parse(cls, name: str) -> Optional["MapId"]:
+        """The inverse of __str__, for the places config names a map.
+
+        Returns None rather than raising: a typo in a config table should
+        cost that one entry, not the whole file.
+        """
+        parts = str(name).strip().lower().lstrip("m").split("_")
+        if len(parts) != 4:
+            return None
+        try:
+            a, b, c, d = (int(p) for p in parts)
+        except ValueError:
+            return None
+        return cls(area=a, block=b, region=c, index=d)
+
 
 class MapConfig:
     """Wraps the [maps] section of config.toml.
@@ -98,6 +114,27 @@ class MapConfig:
         # every map in area 11 is a "Legacy Dungeon", the Roundtable Hold
         # included.
         self.map_labels = dict(maps.get("map_labels", {}))
+        # Maps that are nowhere in the world for good, by name. Not the same
+        # question as `map_places.nowhere`, which is an answer you gave about
+        # one database and can be taken back: this is a fact about the game,
+        # and what it decides is whether the viewer offers to correct it.
+        self.nowhere_maps = set(maps.get("nowhere_maps", []))
+        # Places nobody can measure from a route, put on the map by hand
+        # once and shipped with the tool. A drag lives in `map_places`,
+        # which is a table in one database: it travels with that file and
+        # with nothing else, so a fresh install draws Farum Azula and the
+        # Chapel of Anticipation in the corner of the screen however many
+        # times somebody has already worked out where they go. This is
+        # the same answer written where it belongs -- beside the labels
+        # and the nowhere list, which are facts about the game.
+        self.map_places = {}
+        for name, v in maps.get("map_place", {}).items():
+            m = MapId.parse(name)
+            if m is None or not isinstance(v, (list, tuple)) or len(v) != 2:
+                print(f"  ignoring [maps.map_place] entry {name!r}: "
+                      f"expected a map name and [wx, wz]")
+                continue
+            self.map_places[m.pack()] = (float(v[0]), float(v[1]))
         # Which areas are legacy dungeons, read off the labels rather than
         # kept as a second list beside them -- two lists of the same fact
         # drift, and the label is what the map already calls the place.
@@ -195,6 +232,14 @@ class MapConfig:
         # on. Breaking the line there put five holes in a twelve-minute walk.
         return (a.area in self.open_world_areas
                 or a.area in self.underground_areas)
+
+    def is_nowhere(self, m: MapId) -> bool:
+        """Whether this map is nowhere in the world however it was reached."""
+        return str(m) in self.nowhere_maps
+
+    def placed(self, m: MapId) -> Optional[tuple[float, float]]:
+        """Where this map was put by hand by whoever built the config."""
+        return self.map_places.get(m.pack())
 
     def label(self, m: MapId) -> str:
         named = self.map_labels.get(str(m))

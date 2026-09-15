@@ -15,6 +15,11 @@
 // in the temporal dead zone until its own line runs, and node --check
 // does not catch that.
 const SESSIONS_SHOWN = 6;
+// The last handful, on the map, while the playback runs. Fewer than the
+// panel shows: this one stands on the map and everything it covers is
+// route.
+const PLAY_SESSIONS_SHOWN = 5;
+let playSessShown = PLAY_SESSIONS_SHOWN;
 
 const state = {
   meta: null,
@@ -32,6 +37,14 @@ const state = {
   warpList: [],       // every teleport, including the ones inside dungeons
   alwaysDrawn: new Set(),  // dungeons whose path is on the map at all times
   placedByMap: new Map(),  // map id -> its permanent drawing
+  dungeonName: new Map(),  // map id -> what to call it
+  // map id -> where its pin stands. The far end of a death line can be
+  // inside a *different* dungeon -- die in the Chapel of Anticipation and
+  // the game puts you in the Stranded Graveyard -- and an interior position
+  // is only in that dungeon's own metres, so its pin is the one thing on the
+  // map that stands for it. The same stand-in `warps()` uses server-side for
+  // a jump with an end inside somewhere.
+  dungeonAt: new Map(),
   dungeonFrame: new Map(), // map id -> where its local coordinates sit
   follow: false,      // keep the live position on screen
   followPad: 90,      // and how far from the edge it is allowed to get, in px
@@ -67,7 +80,12 @@ const state = {
   // written, and the overlay only asks every five seconds, so the position
   // mark -- which moves on every sample -- ran ahead of the line behind it.
   liveInside: [],
-  liveInsideLine: null,
+  // Kept beside it, the way `liveT` is kept beside `live`: the tail is banded
+  // by age like the rest of the route, and it is trimmed against what the
+  // committed drawing underneath already covers. Both are questions about
+  // when, and the buffer used to hold only where.
+  liveInsideT: [],
+  liveInsideRuns: [],
   offmap: new Map(),  // visits to places with no position, by map id
   reloadTimer: null,
   reloadMarks: false, // whether the queued reload has to rebuild the marks too
@@ -78,7 +96,7 @@ const renderer = L.canvas({ padding: 0.5 });
 let map, casingGroup, routeGroup, liveGroup, markerGroup, deathGroup,
     respawnGroup, warpGroup, insideGroup, insideLiveGroup, insideRenderer, arcRenderer,
     placedGroup, youMark,
-    tiles, baseTiles, baseOpts, tileOpts, followBox;
+    tiles, baseTiles, baseOpts, tileOpts, followBox, netImage;
 
 /* --- how the path is coloured -------------------------------------------- */
 
@@ -115,6 +133,28 @@ function ageRank(t) {
     const [t0, t1] = state.span || [t, t];
     return (t - t0) / (t1 - t0 || 1);
   }
+  // Everything recorded since the quantiles were fetched is newer than the
+  // last of them, and every bit of it used to come back as exactly 1. On the
+  // surface that is the head of a long route and hard to notice; inside a
+  // dungeon it is the whole drawing, because the only thing on screen is the
+  // visit you are standing in -- measured on a cave entered one second after
+  // the last quantile, every point of it ranked 1 and the ramp was one flat
+  // colour at every horizon, including the fifteen-minute one whose entire
+  // job is to spread the ramp over exactly this.
+  //
+  // The newest sample drawn is the end of the ramp and the feed advances it,
+  // so the play past the last quantile is one more bucket and the clock
+  // splits it -- which is what splits every other bucket here too. One
+  // bucket however long it has been: the quantiles are equal spans of play
+  // and this side of them cannot be measured from here, so it is given the
+  // same share as its neighbours rather than a made-up one.
+  const last = q[q.length - 1];
+  const newest = state.span ? state.span[1] : last;
+  const extra = newest > last ? 1 : 0;
+  const steps = q.length - 1 + extra;
+  if (extra && t >= last) {
+    return (q.length - 1 + Math.min(1, (t - last) / (newest - last))) / steps;
+  }
   let lo = 0, hi = q.length - 1;
   while (lo < hi) {
     const mid = (lo + hi) >> 1;
@@ -132,7 +172,10 @@ function ageRank(t) {
   // each quantile is unchanged.
   const a = q[lo - 1], b = q[lo];
   const f = b > a ? Math.max(0, Math.min(1, (t - a) / (b - a))) : 1;
-  return (lo - 1 + f) / (q.length - 1);
+  // Over `steps`, not over the quantiles alone: with play past the last one
+  // there is a bucket more of ramp to share out, and everything else giving
+  // way by a hundredth is the whole of what that costs.
+  return (lo - 1 + f) / steps;
 }
 
 // How far back the gradient reaches. null is everything recorded; the rest
@@ -236,7 +279,7 @@ function rampColor(t) {
 // What this page needs the recorder to speak. Kept next to the boot check
 // rather than hidden in a module, because the whole point is that someone
 // reading either half can see the pair.
-const NEEDS_API = 25;
+const NEEDS_API = 28;
 
 // Why the line broke, as the recorder reports it. 3 is a load screen, which
 // is the only sign of a respawn there is -- see store.py, where these are
@@ -248,7 +291,7 @@ const BREAK_RELOAD = 3;
 // null: wireControls() threw on the first missing checkbox, boot() never
 // reached reload(), and the result was a blank map whose buttons did nothing
 // -- with no clue that the page itself was half a version old.
-const PAGE_BUILD = 66;
+const PAGE_BUILD = 69;
 
 async function boot() {
   checkPageBuild();
@@ -362,6 +405,8 @@ async function boot() {
     };
     baseTiles = L.tileLayer(v.tile_url, baseOpts).addTo(map);
     tiles = L.tileLayer(v.tile_url, tileOpts);
+    drawNet(v.tile_url);
+    warmBase();
     warmNeighbours();
     let loaded = 0;
     tiles.on('tileload', () => { loaded++; });
@@ -524,6 +569,9 @@ function selectPlane(which) {
 // levels, and never while a gesture is still running.
 let warmTimer = null;
 let warmHeld = [];
+// The coarse level, whole. Held so the browser cannot drop the images
+// between the fetch and the pan that needs them.
+let baseHeld = [];
 
 // One screen of tiles around a point, at the level already on screen, asked
 // for straight away rather than on the idle timer: this is for the moment
@@ -543,6 +591,79 @@ function warmAhead(xy) {
     }
   }
   warmHeld = want.slice(0, 60).map((src) => {
+    const im = new Image();
+    im.src = src;
+    return im;
+  });
+}
+
+// The coarse layer is the safety net under everything: when the detail
+// tiles for somewhere are not in yet, what you see is a blurry version of the
+// right place rather than the empty container behind the map. A net only
+// works where it is, though, and this one was loaded like any other tile
+// layer -- on demand, around wherever you happened to be -- so a pan that
+// outran it showed the container for a frame or two. Which is the flash of
+// background when you drag quickly.
+//
+// The whole level is small enough to simply hold: this map is 38 by 36 tiles
+// at its finest and the coarse layer is three zooms below that, so it is 25
+// images of a few kB. They go through the browser cache, which the tiles are
+// served with a day of, so Leaflet's own request for one is a cache hit and
+// paints in the frame it is made.
+// The one thing under the map that is never rebuilt.
+//
+// The coarse tile layer is a net with a mesh: Leaflet creates and prunes its
+// tiles as you move, so however early they are fetched there are frames --
+// on a fast pan, and on the zoom where both layers rebuild their grids at
+// once -- where a square of it does not exist yet and the container shows
+// through. Warming the cache made those frames rarer and could not make them
+// impossible, because the hole is in the bookkeeping rather than in the
+// network.
+//
+// This is one <img> covering the whole map, positioned once and moved by the
+// same transform as everything else in the pane. It cannot have a hole,
+// because there is nothing to prune. The pyramid's zoom 0 is a single tile
+// with the map in its corner and the rest transparent, so it needs no new
+// asset -- it is 64 times coarser than the layer above it, which makes it a
+// smear of the right colours rather than a picture, and that is all it has
+// to be for the frame or two before the real tiles land.
+function drawNet(url) {
+  if (netImage) { map.removeLayer(netImage); netImage = null; }
+  if (!url || !state.nativeZoom) return;
+  const side = 256 * Math.pow(2, state.nativeZoom);
+  const at = L.latLngBounds(map.unproject([0, 0], state.nativeZoom),
+                            map.unproject([side, side], state.nativeZoom));
+  netImage = L.imageOverlay(
+    L.Util.template(url, { z: 0, x: 0, y: 0, s: '' }), at,
+    // In the tile pane and below both tile layers: the overlay pane is above
+    // the tiles, and a net drawn over the map is not a net.
+    // -1 rather than 0: Leaflet only applies the option if it is truthy, so
+    // a zero leaves the image on `auto` and the layering above it is then a
+    // matter of DOM order. The pane is its own stacking context, so a
+    // negative index here is behind the two tile layers and nothing else.
+    { pane: 'tilePane', zIndex: -1, interactive: false,
+      className: 'base-net' },
+  ).addTo(map);
+}
+
+function warmBase() {
+  if (!baseTiles || !state.imageBounds) return;
+  const z = baseOpts.maxNativeZoom;
+  const size = 256;
+  const a = map.project(state.imageBounds.getNorthWest(), z).divideBy(size);
+  const b = map.project(state.imageBounds.getSouthEast(), z).divideBy(size);
+  const x0 = Math.floor(Math.min(a.x, b.x)), x1 = Math.floor(Math.max(a.x, b.x));
+  const y0 = Math.floor(Math.min(a.y, b.y)), y1 = Math.floor(Math.max(a.y, b.y));
+  const want = [];
+  for (let x = x0; x <= x1; x++) {
+    for (let y = y0; y <= y1; y++) {
+      want.push(L.Util.template(baseTiles._url, { z, x, y, s: '' }));
+    }
+  }
+  // A ceiling rather than a budget, the way warmNeighbours() has one: nothing
+  // here should be able to turn a coarse pyramid somebody built at a finer
+  // zoom into three hundred requests.
+  baseHeld = want.slice(0, 200).map((src) => {
     const im = new Image();
     im.src = src;
     return im;
@@ -613,6 +734,8 @@ function swapTiles(plane, note) {
   if (baseTiles) map.removeLayer(baseTiles);
   if (tiles) map.removeLayer(tiles);
   baseTiles = L.tileLayer(url, baseOpts).addTo(map);
+  drawNet(url);        // the other plane is another pyramid
+  warmBase();
   tiles = L.tileLayer(url, tileOpts).addTo(map);
 }
 
@@ -849,9 +972,28 @@ function heightExtent(segments) {
   return (lo === Infinity) ? [0, 1] : [lo, hi === lo ? lo + 1 : hi];
 }
 
+// What the age ramp is measured back from: the oldest and newest moment
+// *drawn*, which is not the same as the oldest and newest on the world
+// plane. A dungeon is drawn too -- permanently for a castle, on a hover
+// for a cave -- and its samples are not in the route's segments, so a
+// visit running past the last surface sample sat beyond the near end of
+// the ramp. Everything in it then clamped to the newest colour, and
+// because every horizon is measured back from that same end, no setting
+// of the slider changed anything in there.
+//
+// Kept as its own pair rather than folded in where it is worked out:
+// drawSegments() runs on a zoom, which does not refetch the visits, and
+// the span it sets has to come out the same either way.
+function spanWithInsides(span) {
+  const inside = state.insideSpan;
+  if (!inside) return span;
+  if (!span) return [inside[0], inside[1]];
+  return [Math.min(span[0], inside[0]), Math.max(span[1], inside[1])];
+}
+
 function drawSegments(segments) {
   const [lo, hi] = heightExtent(segments);
-  state.span = timeSpan(segments);
+  state.span = spanWithInsides(timeSpan(segments));
   // Kept so the legend can be rewritten as the ramp slides without going back
   // to the segments for a number that has not changed.
   state.hExtent = [lo, hi];
@@ -958,6 +1100,34 @@ function shade(colour, amount) {
   return `rgb(${f(r)},${f(g)},${f(b)})`;
 }
 
+// How far the drawing reaches in time once the dungeons are counted, kept so
+// that drawSegments() can fold it in on a zoom, which does not come back here.
+//
+// A visit's own bounds are enough: `entered_ms` and `left_ms` come with the
+// list, so nothing has to be fetched to know how far in time a place reaches.
+// Counted whether or not that place is drawn permanently -- a cave's path
+// goes up on a hover, and the ramp cannot be one thing for the map and
+// another for what is drawn on top of it.
+function noteInsideSpan(visits) {
+  let t0 = Infinity, t1 = -Infinity;
+  for (const v of (visits || [])) {
+    if (!inWindow(v)) continue;
+    const end = v.left_ms || v.entered_ms;
+    if (v.entered_ms < t0) t0 = v.entered_ms;
+    if (end > t1) t1 = end;
+  }
+  state.insideSpan = t0 === Infinity ? null : [t0, t1];
+  const was = state.span && [state.span[0], state.span[1]];
+  state.span = spanWithInsides(state.span);
+  // The world route was banded against the old span, so if this moved it the
+  // colours out there are a ramp behind. Cheap: a colour per drawn stretch
+  // and a setStyle on the few that crossed a band.
+  if (was && state.span && (was[0] !== state.span[0] || was[1] !== state.span[1])) {
+    ageCache.key = null;
+    recolourRoute(true);
+  }
+}
+
 async function loadInteriors() {
   const seq = ++refreshes.interiors;
   if (!state.layers.interior) {
@@ -977,6 +1147,14 @@ async function loadInteriors() {
   const data = await (await fetch('/api/interiors')).json();
   if (seq !== refreshes.interiors) return;
   markerGroup.clearLayers();
+  noteInsideSpan(data.visits);
+  state.dungeonAt.clear();
+  for (const v of data.visits) {
+    if (v.xy) state.dungeonAt.set(v.map_id, v.xy);
+    // What to call the place, for everything that knows a map id and not a
+    // name -- the busiest-spot rows below, whose jumps carry neither.
+    if (v.label) state.dungeonName.set(v.map_id, v.label);
+  }
 
   // One marker per dungeon, keyed by its map ID. Grouping by position instead
   // put a second marker on the map every time you went back in from a slightly
@@ -1005,8 +1183,22 @@ async function loadInteriors() {
     // The whole group is drawn at the first one's position, so the first one
     // should be at the doorway the route agrees on rather than at whichever
     // visit happens to have walked in first.
-    const door = agreedDoor(data.visits, group[0].map_id);
-    const atDoor = (v) => (door && v.xy && metresApart(v.xy, door) < SAME_DOOR_M
+    // What the *route* says a doorway is, which for a dungeon somebody has
+    // dragged is not what `xy` says: that carries the hand position, the same
+    // one on every visit. The same accessor learnDungeonFrame() uses, so the
+    // pin and the drawing are answering one question.
+    const routeDoor = (v) => (v.door_xy ? v.door_xy : v.xy);
+    const doorway = agreedDoorway(data.visits, group[0].map_id, routeDoor);
+    const door = doorway && doorway.xy;
+    // And a drag moves the place, so every other mouth of it moves by the
+    // same amount -- the drawing is already rigid under a drag and the pins
+    // beside it should not be the one thing that stays behind.
+    const shift = (group[0].door_xy && group[0].xy)
+      ? [group[0].xy[0] - group[0].door_xy[0],
+         group[0].xy[1] - group[0].door_xy[1]]
+      : [0, 0];
+    const atDoor = (v) => (door && routeDoor(v)
+                           && metresApart(routeDoor(v), door) < SAME_DOOR_M
                            ? 0 : 1);
     group.sort((a, b) => (
       atDoor(a) - atDoor(b)
@@ -1065,19 +1257,25 @@ async function loadInteriors() {
     // `routes.db` have two: Stormveil's doors 543 m apart, the Stranded
     // Graveyard's 147, m30_11's 178, and the cave that was reported.
     //
-    // Smaller, and without the badges. The visits and the deaths belong to
-    // the place and not to a door, so saying them twice a few hundred metres
-    // apart would be saying them twice. It is not draggable either: dragging
-    // sets where the dungeon *is*, which is one fact about the map, and the
-    // main pin is the one that carries it.
-    for (const mouth of otherMouths(group, door)) {
+    // The same icon, at the same size. It was smaller and dashed, on the
+    // reasoning that a door is the lesser of the two things -- and drawn that
+    // way it reads as a different kind of place rather than as the same one
+    // seen from its other side, which is what it is. Reported: "make the exit
+    // icon look the same as the normal one."
+    //
+    // Without the badges, though. The visits and the deaths belong to the
+    // place and not to a door, so saying them twice a few hundred metres
+    // apart would be saying them twice. Not draggable either: dragging sets
+    // where the dungeon *is*, and the main pin is the one that carries that.
+    for (const mouth of otherMouths(group, doorway, routeDoor, shift)) {
       const alt = L.marker(toLatLng(mouth.xy), {
         icon: L.divIcon({
-          className: 'cave-mark other-mouth',
+          className: visible ? 'cave-mark keep-mark other-mouth'
+                             : 'cave-mark other-mouth',
           html: `<span>${visible ? '\u265C' : '\u25B2'}</span>`,
-          iconSize: [MOUTH_PX, MOUTH_PX],
-          iconAnchor: [MOUTH_PX / 2, MOUTH_PX + 6],
-          popupAnchor: [0, -(MOUTH_PX + 6)],
+          iconSize: [size, size],
+          iconAnchor: [size / 2, size + 7],
+          popupAnchor: [0, -(size + 7)],
         }),
         riseOnHover: true,
         autoPan: false,
@@ -1145,8 +1343,6 @@ function inWindow(v) {
 }
 
 async function drawWorldVisible(visits, seq) {
-  placedGroup.clearLayers();
-  state.placedByMap.clear();
   // What is actually drawn in the open, which is a question other things ask:
   // a jump's end standing at a castle's pin comes off the world map only
   // because the castle itself is carrying it. Cleared here rather than set
@@ -1154,7 +1350,11 @@ async function drawWorldVisible(visits, seq) {
   // those marks would vanish along with the drawing that was standing in for
   // them -- which is the trap `hiddenInside()` is written around.
   state.alwaysDrawn = new Set();
-  if (!state.layers.interior) return;
+  if (!state.layers.interior) {
+    placedGroup.clearLayers();
+    state.placedByMap.clear();
+    return;
+  }
   // Every path in here is fetched, so a second call can start while this one
   // is still drawing -- and then both add their layers to the same groups,
   // which showed up as every teleport inside a dungeon drawn twice.
@@ -1165,18 +1365,40 @@ async function drawWorldVisible(visits, seq) {
   // everywhere you have been.
   visits = visits.filter((v) => inWindow(v) && onThisPlane(v.plane));
   state.alwaysDrawn = new Set(visits.map((v) => v.map_id));
+  // Every path in hand before anything comes off the map. Clearing first and
+  // fetching afterwards takes the castles away for the length of the fetches
+  // -- which is nothing when you are standing outside, since every finished
+  // visit is cached, and a visible flicker every five seconds while you are
+  // inside one: refreshLiveInside() drops the open visit from the cache each
+  // time, exactly because it is still being written, so that one is a real
+  // round trip with the whole place off the map for it. The same rule the
+  // route and the teleport marks already follow -- fetch first, clear second.
+  const built = [];
   for (const v of visits) {
     const d = await fetchInterior(v);
     if (seq !== undefined && seq !== refreshes.interiors) return;
     if (!d.ok || !d.bounds) continue;
+    built.push([v, d]);
+  }
+  placedGroup.clearLayers();
+  state.placedByMap.clear();
+  // One accumulator per dungeon, because one dungeon is one drawing however
+  // many times you walked through it.
+  const gathered = new Map();
+  for (const [v, d] of built) {
     // A group per dungeon, so the live overlay can take one dungeon's
     // permanent drawing off the map while it draws the same place itself.
     let layer = state.placedByMap.get(v.map_id);
     if (!layer) {
       layer = L.layerGroup().addTo(placedGroup);
       state.placedByMap.set(v.map_id, layer);
+      gathered.set(v.map_id, { v, layer, marks: insideAccumulator() });
     }
-    drawInteriorInto(layer, v, d, renderer, { permanent: true });
+    drawInteriorInto(layer, v, d, renderer,
+                     { permanent: true, marks: gathered.get(v.map_id).marks });
+  }
+  for (const g of gathered.values()) {
+    placeInsideMarks(g.marks, g.v, g.layer, 'deaths', renderer, false);
   }
   // The entrance marks were clustered before this list was known -- and so
   // were the ends of every jump that stands at one of these castles rather
@@ -1205,6 +1427,11 @@ const inside = { key: null, pinned: false, cache: new Map(), timer: null,
                  // the fuse whatever the cursor did next, so moving towards
                  // the thing that had just appeared was what took it away.
                  box: null,
+                 // The newest moment the committed drawing underneath
+                 // reaches. The tail starts there: before this it drew the
+                 // whole visit again, in one flat colour, on top of the
+                 // banded drawing it was duplicating.
+                 drawnTo: null,
                  live: false };
 
 // How far outside the drawn extent still counts as being in it, in screen
@@ -1254,7 +1481,7 @@ async function showInside(group, pin, only) {
 function hideInside(force) {
   if (inside.pinned && !force) return;
   clearTimeout(inside.timer);
-  inside.timer = setTimeout(() => {
+  const put = () => {
     // Nulled as it fires, so `insideHover()` can tell a fuse that is already
     // burning from one it has to light. Without that, a cursor moving away
     // from the drawing restarted the timer on every mouse move and the fuse
@@ -1262,14 +1489,20 @@ function hideInside(force) {
     inside.timer = null;
     insideGroup.clearLayers();
     insideLiveGroup.clearLayers();
-    state.liveInsideLine = null;
+    state.liveInsideRuns = [];
     inside.key = null;
     inside.transform = null;
+    inside.drawnTo = null;
     inside.box = null;
     inside.pinned = false;
     dimBackground(false);
     setCaption(null);
-  }, force ? 0 : 140);
+  };
+  // A hover puts itself away on a fuse, so moving towards the drawing
+  // does not take it down. Everything else means it now: on a zero-delay
+  // timer the clearing could land after whatever the caller drew next.
+  if (force) { put(); return; }
+  inside.timer = setTimeout(put, 140);
 }
 
 // The drawing is a region you can put the cursor in, not a thing you have to
@@ -1333,7 +1566,8 @@ function interiorTransform(v, d) {
   const frame = state.dungeonFrame.get(v.map_id);
   if (frame) return frameTransform(frame);
 
-  if (v.placed === 'by hand' || v.placed === 'the way in') {
+  if (v.placed === 'by hand' || v.placed === 'from config'
+      || v.placed === 'the way in') {
     // Placed at the dungeon it opens off, which is a neighbourhood rather
     // than a doorway. Pinning the first step to that doorway drew the tower
     // setting off out of the castle's front door, which claims a continuity
@@ -1373,6 +1607,33 @@ async function nameDungeon(map_id, name) {
   await loadWarps();
 }
 
+// The point inside a place that a drag is putting somewhere.
+//
+// A position on its own is half a frame. The other half is which point inside
+// the dungeon that position belongs to, and until now that came from whatever
+// the route called the doorway at the moment of drawing -- so the meaning of a
+// hand placement changed under it whenever the route learned a better door.
+//
+// Leyndell is the case. Placed by hand on 5 September, when the only visit was
+// a teleport in and the drawing was therefore centred on its own extent; on
+// 13 September somebody walked in the front door, the frame rebased onto that
+// door 440 m away inside the place, and the whole castle -- the new run and
+// every old one with it -- moved by that much.
+//
+// So the drag sends the base it was aiming with, and learnDungeonFrame() draws
+// the place around it forever after.
+async function handBase(v) {
+  const frame = state.dungeonFrame.get(v.map_id);
+  if (frame) return frame.local;
+  // No frame yet: the drawing is centred on the extent, which is what the
+  // drag was lining up, so that is the point it meant.
+  const d = await fetchInterior(v);
+  if (d && d.ok && d.bounds) {
+    return [(d.bounds.x0 + d.bounds.x1) / 2, (d.bounds.z0 + d.bounds.z1) / 2];
+  }
+  return null;
+}
+
 async function placeDungeon(v, mark) {
   const pr = state.meta.projection;
   const px = map.project(mark.getLatLng(), state.nativeZoom);
@@ -1384,7 +1645,8 @@ async function placeDungeon(v, mark) {
     const res = await fetch('/api/place', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ map_id: v.map_id, wx, wz }),
+      body: JSON.stringify({ map_id: v.map_id, wx, wz,
+                             local: await handBase(v) }),
     });
     const d = await res.json();
     if (!res.ok || !d.ok) {
@@ -1433,6 +1695,61 @@ function metresApart(a, b) {
   return Math.hypot((a[0] - b[0]) / pr.scale_x, (a[1] - b[1]) / pr.scale_y);
 }
 
+// A doorway, said twice: where it is on the map, and where it puts you inside.
+//
+// The second half is what makes two readings comparable at all. Every test
+// here used to ask "same doorway?" as a distance on the surface, and that
+// question has no answer: on m31_15 two readings of one mouth are 19 m apart
+// outside and 10 m apart inside, while its two real mouths are 177 m apart
+// outside and 184 m inside. Nothing measured outside separates those, and
+// inside they are not close.
+//
+// The way out is a doorway too. For a cave walked in one mouth and out the
+// far one it is the only reading that far mouth ever gets -- the visit's
+// anchor is the mouth it came in by, and the `exit` tier only looks at a
+// visit with no entrance of its own. Reported as "there is nothing in the
+// actual exit".
+function doorwaysOf(group, doorOf, withExits) {
+  const at = doorOf || ((v) => v.xy);
+  const out = [];
+  for (const v of group) {
+    const secs = Math.max(1, (v.duration_ms || 0) / 1000);
+    const xy = at(v);
+    if (xy) out.push({ xy, local: v.first_local || null, secs });
+    if (withExits && v.exit_xy && v.exit_local) {
+      out.push({ xy: v.exit_xy, local: v.exit_local, secs });
+    }
+  }
+  return out;
+}
+
+// Whether two readings are of the same mouth. Close in *either* space is
+// enough to say yes, because a doorway is one place in both and only a
+// genuinely different mouth is far away in both. Measured: Stormveil's second
+// door is read once on the way in and once on the way out, and the two land
+// on the same surface pixel while being 20 m apart inside -- you walk a
+// little before the map changes -- so asking inside alone split one doorway
+// into two pins standing on each other.
+function sameMouth(a, b) {
+  if (a.local && b.local && metresApart(a.local, b.local) < SAME_DOOR_M) {
+    return true;
+  }
+  return metresApart(a.xy, b.xy) < SAME_DOOR_M;
+}
+
+// Where a reading says the dungeon's own origin lands: its map position less
+// its local one. Two readings of one doorway imply the same origin to within
+// sampling noise; a coarse reading of it does not, which is what tells a good
+// reading from a bad one. It cannot tell two *mouths* apart -- an interior
+// laid out to match the ground above it implies the same origin at both, and
+// on m31_15 the far mouth's origin is 4.7 m from the near one's -- so it is
+// only ever asked within one mouth.
+function impliedOrigin(c) {
+  const pr = state.meta.projection;
+  return [c.xy[0] - c.local[0] * pr.scale_x,
+          c.xy[1] - c.local[1] * pr.scale_y];
+}
+
 // Which of a dungeon's doorways the route agrees on.
 //
 // A dungeon with two mouths gets an anchor at whichever one each visit
@@ -1445,18 +1762,14 @@ function metresApart(a, b) {
 // from, and the marker goes there too. It is a count and not a medoid because
 // the question is not "where is the middle of these" -- two real mouths have
 // no meaningful middle -- but "which of these doors is the one you use".
-// How wide a second pin is. Smaller than the main one, which is 20 to 34 px
-// by how long you have spent in the place: this one is a door and not the
-// place, so it should read as the lesser of the two.
-const MOUTH_PX = 17;
-
 // The mouths of a dungeon that are not the one its pin stands at. Clustered
 // at the same tolerance the door vote uses, so several readings of one doorway
 // stay one doorway and only a genuinely different way in earns a pin.
-function otherMouths(group, door) {
+function otherMouths(group, doorway, doorOf, shift) {
   const out = [];
-  const at = door || (group[0] && group[0].xy);
+  const at = doorway && doorway.xy;
   if (!at) return out;
+  const move = shift || [0, 0];
   // How big the place is, in its own metres. Two mouths of one dungeon cannot
   // be further apart than the dungeon is -- which is the test that already
   // tells a door from a gate in `warps()` and stops the entrance vote
@@ -1477,16 +1790,39 @@ function otherMouths(group, door) {
   // recorded inside says nothing about its own size, and the rule is the one
   // the placement tiers use: drop an anchor against evidence, never for the
   // lack of it.
+  // And the last test, which is the one that was missing: a second mouth has
+  // to be somewhere else *inside*. Two readings of one doorway can sit 19 m
+  // apart on the surface -- five-second sampling against quarter-second --
+  // and that is over the tolerance, so the coarse one was drawn as a mouth
+  // standing beside the real one. Inside, those two are 10 m apart and the
+  // cave's actual second mouth is 184 m away.
+  //
+  // A reading with nothing recorded inside cannot answer, and is not promoted
+  // to a mouth on a surface distance alone: the anchor of a visit that stored
+  // no samples is a position and not a doorway.
   const room = group.reduce((m, v) => Math.max(m, v.extent_m || 0), 0);
-  for (const v of group) {
-    if (!v.xy) continue;
-    const off = metresApart(v.xy, at);
+  for (const c of doorwaysOf(group, doorOf, true)) {
+    if (!c.local || !doorway.local) continue;
+    if (metresApart(c.local, doorway.local) < SAME_DOOR_M) continue;
+    const off = metresApart(c.xy, at);
     if (off < SAME_DOOR_M) continue;
     if (room && off > room) continue;
-    const near = out.find((m) => metresApart(m.xy, v.xy) < SAME_DOOR_M);
-    if (near) near.n += 1;
-    else out.push({ xy: v.xy, n: 1 });
+    const near = out.find((m) => sameMouth(m, c));
+    if (near) {
+      near.n += 1;
+      // Within one mouth, the reading the agreed doorway's own frame agrees
+      // with: a good reading of either mouth implies the same origin, a
+      // coarse one does not. On m31_15 that is the difference between the far
+      // mouth landing on the 12 September reading and on the five-second
+      // import's, which are 13 m apart.
+      if (metresApart(impliedOrigin(c), impliedOrigin(doorway))
+          < metresApart(impliedOrigin(near), impliedOrigin(doorway))) {
+        near.xy = c.xy;
+        near.local = c.local;
+      }
+    } else out.push({ xy: c.xy, local: c.local, n: 1 });
   }
+  for (const m of out) m.xy = [m.xy[0] + move[0], m.xy[1] + move[1]];
   return out;
 }
 
@@ -1494,7 +1830,7 @@ function otherMouths(group, door) {
 // is drawn, which is the same thing everywhere except a dungeon placed by
 // hand -- there every visit carries the one position you gave, and the route's
 // own doorways are the thing being voted on.
-function agreedDoor(visits, map_id, doorOf) {
+function agreedDoorway(visits, map_id, doorOf) {
   const at = doorOf || ((v) => v.xy);
   const here = visits.filter((v) => v.map_id === map_id && at(v));
   // Weighted by the time spent inside on each visit, not by the number of
@@ -1509,12 +1845,47 @@ function agreedDoor(visits, map_id, doorOf) {
   // five dungeons whose visits disagree about the door, count and time pick
   // the same one in all five -- Sellia Crystal Tunnel is 4 visits and 1,914 s
   // at one mouth against 1 visit and 30 s at the other, and agrees either way.
-  const weight = (v) => Math.max(1, (v.duration_ms || 0) / 1000);
+  //
+  // Which mouth is one question and which *reading* of it to believe is
+  // another, and one vote was answering both. Time is right for the first
+  // and says nothing about the second: on m31_15 the longest visit is the
+  // 405-second one from the five-second import, whose anchor lands 19 m from
+  // the three live readings that agree to a metre -- so the pin stood 19 m
+  // off the mouth, and because 19 m is over SAME_DOOR_M the real mouth got a
+  // second-mouth pin of its own standing next to it. Reported as "the exit
+  // icon is on the entrance, and the normal icon is just kinda beside it".
+  //
+  // So the mouths are gathered first, by where they put you inside; time
+  // picks which mouth; and within it the reading that the most other
+  // readings of that mouth agree with -- by the origin each implies -- is
+  // the one the pin stands at, with time again as the tie-break.
+  const list = doorwaysOf(here, at, false);
+  if (!list.length) return null;
   let best = null, bestW = 0;
-  for (const a of here) {
-    const w = here.filter((b) => metresApart(at(a), at(b)) < SAME_DOOR_M)
-                  .reduce((sum, b) => sum + weight(b), 0);
-    if (w > bestW) { bestW = w; best = at(a); }
+  for (const a of list) {
+    const mouth = list.filter((b) => sameMouth(a, b));
+    const w = mouth.reduce((sum, b) => sum + b.secs, 0);
+    if (w > bestW) { bestW = w; best = mouth; }
+  }
+  if (!best) return null;
+  return bestReading(best);
+}
+
+// Which reading of one mouth to hang the place off. The one whose implied
+// origin the most others share; time only breaks a tie, because it is the
+// right question for which mouth you used and says nothing at all about
+// which measurement of it is the good one.
+function bestReading(mouth) {
+  let best = null, bestN = 0, bestT = 0;
+  for (const c of mouth) {
+    const agree = c.local
+      ? mouth.filter((o) => o.local && metresApart(impliedOrigin(c),
+                                                   impliedOrigin(o)) < SAME_DOOR_M)
+      : [c];
+    const secs = agree.reduce((sum, o) => sum + o.secs, 0);
+    if (agree.length > bestN || (agree.length === bestN && secs > bestT)) {
+      bestN = agree.length; bestT = secs; best = c;
+    }
   }
   return best;
 }
@@ -1556,7 +1927,11 @@ async function learnDungeonFrame(visits) {
   // through from another dungeon does the same, and walking out ties it to
   // the last step before the door. In that order, because that is the order
   // of how directly each was measured.
-  const byHand = new Set(visits.filter((v) => v.placed === 'by hand')
+  // A position somebody gave this place, whether that was you dragging its
+  // marker or the config that shipped with the tool. Both are one point for
+  // the whole map and are drawn the same way.
+  const byHand = new Set(visits.filter((v) => v.placed === 'by hand'
+                                          || v.placed === 'from config')
                                .map((v) => v.map_id));
   // What the *route* says a visit's doorway is, which for a dungeon somebody
   // has placed by hand is not what `xy` and `placed` say: those carry the
@@ -1682,6 +2057,19 @@ async function learnDungeonFrame(visits) {
   for (const map_id of byHand) {
     const mine = visits.filter((v) => v.map_id === map_id && v.xy);
     const frame = state.dungeonFrame.get(map_id);
+    // A drag that recorded what it meant is a whole frame: that point
+    // inside, at that place on the map. Nothing learned since can move
+    // it -- which is the difference between a placement that holds and
+    // one that quietly rebases the next time somebody walks in a door
+    // the route had not seen. The turn is still the route's: a drag
+    // says where a place is, not which way it faces.
+    const base = mine.length ? mine[0].hand_local : null;
+    if (base) {
+      state.dungeonFrame.set(map_id, {
+        local: base, xy: mine[0].xy, turn: frame && frame.turn,
+      });
+      continue;
+    }
     if (frame && mine.length) {
       // The route knows a doorway here, and the pin has been standing at it.
       // Dragging the pin therefore says where that doorway is and nothing
@@ -1706,6 +2094,66 @@ async function learnDungeonFrame(visits) {
       local: [(x0 + x1) / 2, (z0 + z1) / 2], xy: mine[0].xy,
     });
   }
+}
+
+// What a mark inside a dungeon says. The same shape as the world's popups --
+// a title that counts, up to eight moments, and the action where there is
+// exactly one to act on -- in the words that are true in here: there is no
+// world position to name, and the place is the one being drawn.
+function insideWhere(v) {
+  return `Inside ${v.label} (${v.map})`;
+}
+
+function insideMore(list) {
+  return list.length > 8 ? `<br>and ${list.length - 8} more` : '';
+}
+
+function insideDeathPopup(list, v) {
+  const n = list.length;
+  const when = list.slice(0, 8)
+    .map((x) => new Date(x.dead.ts).toLocaleString()).join('<br>');
+  const html = `<b>${n > 1 ? `Died ${n} times here` : 'Died'}</b><br>`
+    + `${insideWhere(v)}<br>${when}${insideMore(list)}`;
+  // Only where there is one of them to take back: a cluster of twelve deaths
+  // has no single ts to clear, and only you know which of them was not one.
+  const mine = n === 1 && list[0].dead.by_hand ? list[0].dead : null;
+  return mine
+    ? popupWithAction(html + '<br><span class="hint">You marked this one.</span>',
+                      'Not a death after all',
+                      () => { map.closePopup();
+                              callDeath({ ts: mine.ts, clear: true }); })
+    : asElement(html);
+}
+
+function insideRespawnPopup(list, v) {
+  const n = list.length;
+  const when = list.slice(0, 8).map(
+    (x) => `${new Date(x.back.ts).toLocaleString()} - ${x.back.after_s}s after dying`
+  ).join('<br>');
+  return asElement(
+    `<b>${n > 1 ? `Got up here ${n} times` : 'Got up here'}</b><br>`
+    + `${insideWhere(v)}<br>${when}${insideMore(list)}`);
+}
+
+function insideWarpPopup(list, which, v) {
+  const n = list.length;
+  const title = which === 'to'
+    ? (n > 1 ? `Arrived here ${n} times` : 'Arrived here')
+    : (n > 1 ? `Left from here ${n} times` : 'Left from here');
+  const rows = list.slice(0, 8).map(
+    (e) => `${new Date(e.jump.ts).toLocaleString()} - ${e.jump.distance_m} m`
+  ).join('<br>');
+  const html = `<b>${title}</b><br>${insideWhere(v)}<br>${rows}${insideMore(list)}`;
+  // Inside a dungeon is where the ambiguity actually lives: no HP reading
+  // survives in old routes, so a lift, a teleporter and a death all look the
+  // same. This is where you say which -- one jump at a time, because a
+  // cluster can hold several and only you know which of them killed you.
+  return n === 1
+    ? popupWithAction(html, 'This was a death',
+                      () => { map.closePopup();
+                              callDeath({ ts: list[0].jump.ts,
+                                          from_ts: list[0].jump.from_ts }); })
+    : asElement(html);
 }
 
 function drawInteriorInto(group, v, d, lineRenderer, opts) {
@@ -1781,6 +2229,22 @@ function drawInteriorInto(group, v, d, lineRenderer, opts) {
     }
   }
 
+  // Everything that can land on a point in here, gathered before any of it is
+  // drawn, and then put down through the same two rules the world map uses:
+  // several of one kind at one point are one mark with a count, and different
+  // kinds at one point are one mark divided between them.
+  //
+  // This was the half nobody had brought together. A grace you keep getting
+  // up at is often a waygate you keep arriving at, so inside a castle they
+  // stacked exactly the way the world's marks used to -- measured over the
+  // four castles in routes.db, 99 marks with 93 pairs of them within six
+  // pixels of each other, 57 of one kind and 36 of two.
+  //
+  // Gathered into the caller's accumulator where it gives one, because a
+  // drawing is every visit to a place and a place is one place: see
+  // placeInsideMarks() below.
+  const acc = (opts && opts.marks) || insideAccumulator();
+
   // Lifts and teleporters inside the place. They have no world position --
   // nothing in a dungeon does -- so this drawing is the only frame they can
   // be shown in, and without it a jump inside a castle was invisible.
@@ -1788,12 +2252,14 @@ function drawInteriorInto(group, v, d, lineRenderer, opts) {
   // Gated on the toggle like the deaths and respawns below: these are drawn
   // into the dungeon's own pane rather than into warpGroup, so unticking
   // Teleports emptied that group and left eight of them on the castles.
+  //
+  // A legacy dungeon is drawn on the map at all times, so a line standing
+  // between two of its rooms for ever is one more thing on a busy map that
+  // nobody asked for: those answer on hover, like the world's do. A cave's
+  // drawing only exists while you are looking at it, and looking at it *is*
+  // the asking -- so in there the line is part of the drawing.
+  const always = !(opts && opts.permanent);
   for (const { w: jump, ends: here } of (state.warps ? warpsInside(v) : [])) {
-    const spots = here.map((which) => {
-      const local = which === 'to' ? jump.local : jump.from_local;
-      return [which, at(local[0], local[1]),
-              which === 'to' ? '\u2726' : '\u2727'];
-    });
     // Where it goes, in whatever frame each end is drawn in: this dungeon's
     // for an end inside it, and the world's for one out on the surface, which
     // is the same pixels once both are projected. Said before that there was
@@ -1808,47 +2274,13 @@ function drawInteriorInto(group, v, d, lineRenderer, opts) {
       return which === 'to' ? jump.xy : jump.from_xy;
     };
     const pair = [endAt('from'), endAt('to')];
-    // A legacy dungeon is drawn on the map at all times, so a line standing
-    // between two of its rooms for ever is one more thing on a busy map that
-    // nobody asked for: those answer on hover, like the world's do. A cave's
-    // drawing only exists while you are looking at it, and looking at it *is*
-    // the asking -- so in there the line is part of the drawing.
-    const always = !(opts && opts.permanent);
     if (always && pair[0] && pair[1]) {
-      L.polyline([toLatLng(pair[0]), toLatLng(pair[1])], {
-        renderer: lineRenderer,
-        color: '#8fb7cc', weight: 2, opacity: 0.75, dashArray: '5,7',
-      }).addTo(group);
+      L.polyline([toLatLng(pair[0]), toLatLng(pair[1])],
+                 jumpLine(lineRenderer)).addTo(group);
     }
-    for (const [which, pt, glyph] of spots) {
-      const mark = L.marker(toLatLng(pt), {
-        pane: markPane,
-        icon: L.divIcon({
-          className: which === 'to' ? 'warp-mark' : 'warp-mark warp-from',
-          html: `<span>${glyph}</span>`,
-          iconSize: [18, 18], iconAnchor: [9, 9],
-        }),
-        keyboard: false,
-      })
-        // Inside a dungeon is where the ambiguity actually lives: no HP
-        // reading survives in old routes, so a lift, a teleporter and a death
-        // all look the same. This is where you say which.
-        .bindPopup(popupWithAction(
-          `<b>${which === 'to' ? 'Arrived here' : 'Left from here'}</b><br>` +
-          `Inside ${v.label} (${v.map})<br>${jump.distance_m} m<br>` +
-          `${new Date(jump.ts).toLocaleString()}`,
-          'This was a death',
-          () => { map.closePopup(); callDeath({ ts: jump.ts, from_ts: jump.from_ts }); }))
-        .addTo(group);
-      // The same answer the world's teleport marks give, which these did not.
-      // Drawn on the hover rather than left standing: a legacy dungeon is on
-      // the map at all times, so a permanent line meant its jumps were always
-      // announcing where they went while a cave's said nothing until you
-      // asked. Reported as both halves of that at once.
-      if (!always) {
-        mark.on('mouseover', () => showWarpLines([pair], group, lineRenderer));
-        mark.on('mouseout', hideWarpLines);
-      }
+    for (const which of here) {
+      const local = which === 'to' ? jump.local : jump.from_local;
+      acc.ends.push({ which, jump, pair, pt: at(local[0], local[1]) });
     }
   }
 
@@ -1867,44 +2299,92 @@ function drawInteriorInto(group, v, d, lineRenderer, opts) {
       if (near) pt = at(near[0], near[1]);
     }
     if (!pt) continue;
-    L.marker(toLatLng(pt), {
-      pane: markPane,
-      icon: L.divIcon({
-        className: 'death-mark', html: '<span>\u2715</span>',
-        iconSize: [18, 18], iconAnchor: [9, 9],
-      }),
-    })
-      .bindPopup(dead.by_hand
-        ? popupWithAction(
-            `<b>Died</b><br>Inside ${v.label} (${v.map})<br>` +
-            `${new Date(dead.ts).toLocaleString()}` +
-            `<br><span class="hint">You marked this one.</span>`,
-            'Not a death after all',
-            () => { map.closePopup();
-                    callDeath({ ts: dead.ts, clear: true }); })
-        : `<b>Died</b><br>Inside ${v.label} (${v.map})<br>` +
-          `${new Date(dead.ts).toLocaleString()}`)
-      .addTo(group);
+    // What it cost you, drawn while you point at it -- the answer the
+    // world's death marks have always given and these never did. On hover in
+    // both kinds of drawing: a castle is on the map at all times and a line
+    // standing between every death and its grace would be a permanent
+    // scribble across it, and a cave's drawing is small enough that twelve
+    // of them would bury the path they are drawn on.
+    const grace = dead.respawn
+      ? markEndAt(dead.respawn.map_id, dead.respawn.local,
+                  dead.respawn.xy, v, at)
+      : null;
+    acc.fallen.push({ dead, pt, grace });
   }
 
   // And where you got up again, when that was in here too.
   if (state.respawns) {
     for (const back of respawnsInside(v)) {
-      const pt = at(back.local[0], back.local[1]);
-      L.marker(toLatLng(pt), {
-        pane: markPane,
-        icon: L.divIcon({
-          className: 'respawn-mark', html: '<span>\u2739</span>',
-          iconSize: [18, 18], iconAnchor: [9, 9],
-        }),
-      })
-        .bindPopup(`<b>Got up here</b><br>Inside ${v.label} (${v.map})<br>` +
-                   `${back.after_s}s after dying<br>` +
-                   `${new Date(back.ts).toLocaleString()}`)
-        .addTo(group);
+      // Either end draws the line, the way either end of a teleport does.
+      // The death this grace belongs to is found by the moment it happened,
+      // which the respawn carries: a death and a visit are a point and a
+      // window, and the point is the one that knows.
+      const died = (state.deathList || []).find((x) => x.ts === back.died_ts);
+      acc.got.push({
+        back, pt: at(back.local[0], back.local[1]),
+        from: died ? markEndAt(died.map_id, died.local, died.xy, v, at) : null,
+      });
     }
   }
+
+  // Nobody gathering for us: this drawing is one visit and it can place its
+  // own.
+  if (!(opts && opts.marks)) {
+    placeInsideMarks(acc, v, group, markPane, lineRenderer, always);
+  }
   return at;
+}
+
+// What one drawing is going to put down, gathered across every visit in it
+// before any of it is clustered.
+//
+// Per drawing rather than per visit, because a place you went back to is one
+// place -- hovering a cave draws every run through it, and the marks belong
+// to the cave rather than to the run. A grace you got up at 21 times over
+// nine visits was nine marks on one pixel, each counting only its own visit,
+// which is the same stacking as before one level up: the busiest of them
+// showed 9, and the panel, which counts the place, said 21.
+function insideAccumulator() {
+  return { ends: [], fallen: [], got: [] };
+}
+
+// Any visit of the drawing will do for the words -- they are all the same
+// map, and what a mark says is where it is rather than which run it was on.
+function placeInsideMarks(acc, v, group, markPane, lineRenderer, always) {
+  const cells = [];
+  const home = { group, pane: markPane, lineGroup: group, lineRenderer };
+  for (const which of ['to', 'from']) {
+    const mine = acc.ends.filter((e) => e.which === which);
+    for (const c of clusterMarks(mine, (e) => e.pt)) {
+      cells.push(Object.assign({}, home, {
+        xy: c.xy, n: c.list.length, family: 'warp',
+        cls: which === 'to' ? 'warp' : 'warp warp-from',
+        glyph: which === 'to' ? '\u2726' : '\u2727',
+        popup: insideWarpPopup(c.list, which, v),
+        // The same answer the world's teleport marks give, which these did
+        // not. Not in a cave, where the line is already standing.
+        warps: always ? []
+          : c.list.map((e) => e.pair).filter((p) => p[0] && p[1]),
+      }));
+    }
+  }
+  for (const c of clusterMarks(acc.fallen, (x) => x.pt)) {
+    cells.push(Object.assign({}, home, {
+      xy: c.xy, n: c.list.length, cls: 'death', glyph: '\u2715',
+      popup: insideDeathPopup(c.list, v),
+      deaths: c.list.filter((x) => x.grace)
+        .map((x) => ({ from: c.xy, to: x.grace })),
+    }));
+  }
+  for (const c of clusterMarks(acc.got, (x) => x.pt)) {
+    cells.push(Object.assign({}, home, {
+      xy: c.xy, n: c.list.length, cls: 'respawn', glyph: '\u2739',
+      popup: insideRespawnPopup(c.list, v),
+      deaths: c.list.filter((x) => x.from)
+        .map((x) => ({ from: x.from, to: c.xy })),
+    }));
+  }
+  placeMarks(cells, group, markPane);
 }
 
 // The extent of what has just been drawn, with a little air around it, in
@@ -1925,10 +2405,18 @@ function insideBox(corners) {
   return [x0 - air, y0 - air, x1 + air, y1 + air];
 }
 
+// The newest moment anything in this payload was recorded at. RDP keeps the
+// ends of a segment, so the last simplified point is the last real one.
+function drawnUpTo(d) {
+  let newest = 0;
+  for (const seg of d.segments) {
+    for (const t of seg.t) if (t > newest) newest = t;
+  }
+  return newest || null;
+}
+
 function drawInside(drawn, group, single) {
   insideGroup.clearLayers();
-  // Whatever the frame is now, the tail belongs in it.
-  setTimeout(redrawLiveInside, 0);
   const { v, d } = drawn[0];
   // Dimming exists to stop a cave's path being lost in the route around it.
   // A legacy dungeon is already drawn out there in the open, so hovering one
@@ -1954,23 +2442,47 @@ function drawInside(drawn, group, single) {
     // thing you hovered to open it would close the moment you set off.
     if (anchor) corners.push(anchor);
   };
+  const marks = insideAccumulator();
   const at0 = drawInteriorInto(insideGroup, v, d, insideRenderer,
-                               { faint: true });
+                               { faint: true, marks });
   inside.transform = { map_id: v.map_id, at: at0 };
+  inside.drawnTo = drawnUpTo(d);
+  // In this frame rather than on a timer. Within one canvas the order layers
+  // go on is the order they are painted, so re-adding the path puts it over
+  // the tail -- and putting the tail back a task later left a window where a
+  // paint could catch the whole cave wearing the drawing underneath, casing
+  // and all, before it went back to normal. Once every five seconds, which
+  // is "every few seconds the path seems to flicker once".
+  redrawLiveInside();
   keep(at0, d.bounds, v.xy);
   for (const other of drawn.slice(1)) {
     const at = drawInteriorInto(insideGroup, other.v, other.d, insideRenderer,
-                                { faint: true });
+                                { faint: true, marks });
     keep(at, other.d.bounds, other.v.xy);
   }
+  // Every visit's marks at once, so a grace you got up at on six of them is
+  // one mark reading 6 rather than six marks reading 1.
+  placeInsideMarks(marks, v, insideGroup, 'insideMarks', insideRenderer, true);
   inside.box = insideBox(corners);
 
   if (inside.box && !inside.pinned) {
     const [x0, y0, x1, y1] = inside.box;
-    L.rectangle([toLatLng([x0, y0]), toLatLng([x1, y1])], {
+    const at = [toLatLng([x0, y0]), toLatLng([x1, y1])];
+    // Twice: a dark line under an amber one. A hairline of amber over
+    // painted terrain reads as part of the map -- the same thing the edge
+    // margin's box is drawn around, and it solves it the same way, except
+    // that this is canvas rather than CSS so the ring is a second rectangle
+    // laid down first. At a 45% amber hairline over a dimmed cave it was
+    // there and could not be found.
+    L.rectangle(at, {
       renderer: insideRenderer,
-      color: 'rgba(224, 163, 60, 0.45)', weight: 1, dashArray: '4,5',
-      fill: true, fillColor: '#e0a33c', fillOpacity: 0.03,
+      color: '#07100e', weight: 4, opacity: 0.55, fill: false,
+      interactive: false,
+    }).addTo(insideGroup);
+    L.rectangle(at, {
+      renderer: insideRenderer,
+      color: '#e0a33c', weight: 1.8, opacity: 0.9, dashArray: '7,6',
+      fill: true, fillColor: '#e0a33c', fillOpacity: 0.05,
       interactive: false,
     }).addTo(insideGroup);
   }
@@ -1989,6 +2501,9 @@ function drawInside(drawn, group, single) {
           (blank ? ` (${blank} recorded no movement)` : '')
         : '');
   const how = {
+    'from config': `Drawn to the map's scale where the tracker says it is; ` +
+                   `which way it faces is the dungeon's own, and only a ` +
+                   `second way in can measure that.`,
     'by hand': `Drawn to the map's scale where you put it; which way it ` +
                `faces is the dungeon's own, and only a second way in can ` +
                `measure that.`,
@@ -2167,8 +2682,13 @@ function interiorPopup(group) {
     'the way in': 'Placed at the dungeon it opens off, because nothing ' +
                   'recorded says where this one is. Drag this marker to ' +
                   'where it belongs and it will stay there.',
-    'by hand': 'You placed this one. Drag it again to move it, or take it '
-               + 'off the map if it does not belong on one.',
+    'from config': 'Placed with the tracker, because nothing recorded '
+                   + 'says where it is. Drag it if you know better; your '
+                   + 'own position is kept in this database.',
+    'by hand': 'You placed this one, because nothing recorded says where '
+               + 'it is. Walk in through a door and the recording takes '
+               + 'over. Drag it again to move it, or take it off the map '
+               + 'if it does not belong on one.',
   };
   for (const how of Object.keys(placedNote)) {
     if (!group.some((v) => v.placed === how)) continue;
@@ -2182,6 +2702,21 @@ function interiorPopup(group) {
   // back out of a placement -- it goes to the corner of the screen instead,
   // and Put on map brings it back.
   if (group.some((v) => v.placed === 'by hand')) {
+    // And the way back. A hand placement outranks every inference for
+    // good reasons, but the route can know better later -- it did for
+    // Leyndell, which was placed when nothing had walked in its front
+    // door and was 440 m out once something had. Clearing hands the
+    // question back to the tiers, which is exactly what is wanted then.
+    const back = document.createElement('button');
+    back.className = 'ghost';
+    back.textContent = "Use the route's own position";
+    back.title = 'Forget where you put this one and place it from the '
+                 + 'recording again';
+    back.addEventListener('click', () => {
+      map.closePopup();
+      resetPlacement(group[0].map_id, group[0].label);
+    });
+    el.appendChild(back);
     const off = document.createElement('button');
     off.className = 'ghost';
     off.textContent = 'Take it off the map';
@@ -2206,6 +2741,7 @@ async function openInterior(v, corner) {
                 box.classList.add('from-corner'); }
   // Which visit is on screen, so pressing the same button again can put it
   // away rather than redrawing what is already there.
+  if (state.insetKey !== insideKey(v)) insetReset();
   state.insetKey = insideKey(v);
   state.insetMap = v.map;
   control('inset-title').textContent = v.label;
@@ -2238,8 +2774,67 @@ function closeInterior() {
   state.insetMap = null;
 }
 
+// Zooming the drawing. The scale is the fit times insetView.zoom, so
+// keeping the point under the cursor still is a matter of measuring
+// where it lands afterwards and moving the pan by the difference.
+function insetZoomAt(px, py, factor) {
+  const d = state.inset;
+  if (!d || !d.bounds) return;
+  const size = 352;
+  const before = insetFit(d, size, 16);
+  const wx = (px - before.ox) / before.sc;
+  const wz = (py - before.oy) / before.sc;
+  insetView.zoom = Math.min(16, Math.max(1, insetView.zoom * factor));
+  const after = insetFit(d, size, 16);
+  insetView.x += px - (wx * after.sc + after.ox);
+  insetView.y += py - (wz * after.sc + after.oy);
+  // All the way out is the fit, exactly: rounding a pan back to zero by
+  // hand is not something anyone should have to do.
+  if (insetView.zoom === 1) { insetView.x = 0; insetView.y = 0; }
+  drawInterior(d);
+}
+
+function insetReset() {
+  insetView.zoom = 1;
+  insetView.x = 0;
+  insetView.y = 0;
+}
+
 function wireInset() {
   document.getElementById('inset-close').addEventListener('click', closeInterior);
+  const cv = document.getElementById('inset-canvas');
+  if (cv) {
+    cv.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const r = cv.getBoundingClientRect();
+      insetZoomAt(e.clientX - r.left, e.clientY - r.top,
+                  e.deltaY < 0 ? 1.25 : 1 / 1.25);
+    }, { passive: false });
+    // Dragging moves the drawing under the window, which only means
+    // anything once it is bigger than the window.
+    let from = null;
+    cv.addEventListener('pointerdown', (e) => {
+      if (insetView.zoom <= 1) return;
+      from = [e.clientX, e.clientY];
+      cv.setPointerCapture(e.pointerId);
+      cv.classList.add('dragging');
+    });
+    cv.addEventListener('pointermove', (e) => {
+      if (!from) return;
+      insetView.x += e.clientX - from[0];
+      insetView.y += e.clientY - from[1];
+      from = [e.clientX, e.clientY];
+      if (state.inset) drawInterior(state.inset);
+    });
+    const done = () => { from = null; cv.classList.remove('dragging'); };
+    cv.addEventListener('pointerup', done);
+    cv.addEventListener('pointercancel', done);
+    // The way back to the whole shape.
+    cv.addEventListener('dblclick', () => {
+      insetReset();
+      if (state.inset) drawInterior(state.inset);
+    });
+  }
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') closeInterior();
   });
@@ -2254,6 +2849,26 @@ function niceStep(metresPerPixel, targetPx) {
     if (m / metresPerPixel >= targetPx) return m;
   }
   return 1000;
+}
+
+// How the inset is looking at the place: the fit, times a zoom, plus a
+// pan in screen pixels. Reset whenever a different visit is opened, so
+// the window always starts by showing the whole shape.
+const insetView = { zoom: 1, x: 0, y: 0 };
+
+function insetFit(d, size, pad) {
+  const b = d.bounds;
+  const w = Math.max(b.x1 - b.x0, 1);
+  const h = Math.max(b.z1 - b.z0, 1);
+  // One scale for both axes. Stretching each to fill the box would draw
+  // a corridor as a room, and the shape is what this panel is for.
+  const sc = Math.min((size - pad * 2) / w, (size - pad * 2) / h)
+             * insetView.zoom;
+  return {
+    sc,
+    ox: pad + (size - pad * 2 - w * sc) / 2 - b.x0 * sc + insetView.x,
+    oy: pad + (size - pad * 2 - h * sc) / 2 - b.z0 * sc + insetView.y,
+  };
 }
 
 function drawInterior(d) {
@@ -2276,13 +2891,7 @@ function drawInterior(d) {
 
   const b = d.bounds;
   const pad = 16;
-  const w = Math.max(b.x1 - b.x0, 1);
-  const h = Math.max(b.z1 - b.z0, 1);
-  // One scale for both axes. Stretching each to fill the box would draw a
-  // corridor as a room, and the shape is the only thing this panel is for.
-  const sc = Math.min((size - pad * 2) / w, (size - pad * 2) / h);
-  const ox = pad + (size - pad * 2 - w * sc) / 2 - b.x0 * sc;
-  const oy = pad + (size - pad * 2 - h * sc) / 2 - b.z0 * sc;
+  const { sc, ox, oy } = insetFit(d, size, pad);
   const at = (x, z) => [x * sc + ox, z * sc + oy];
 
   const step = niceStep(1 / sc, 40);
@@ -2402,104 +3011,345 @@ async function loadDeaths() {
   state.respawnList = data.deaths
     .filter((d) => d.respawn)
     .map((d) => ({ ...d.respawn, died_ts: d.ts, died_map: d.map,
-                   died_xy: d.xy }));
-  drawRespawns();
-  if (!state.deaths) return;
-
-  // Dying twice to the same thing is normal, and two marks on one spot look
-  // like one. Cluster anything within a few metres and count it instead.
-  const clusters = [];
-  for (const d of data.deaths.filter(
-    (d) => d.xy && markPlane(d)
-      && (!state.range || (d.ts >= state.range[0] && d.ts <= state.range[1]))
-  )) {
-    if (hiddenInside(d)) continue;
-    const near = clusters.find(
-      (c) => Math.abs(c.xy[0] - d.xy[0]) < 12 && Math.abs(c.xy[1] - d.xy[1]) < 12);
-    if (near) near.list.push(d);
-    else clusters.push({ xy: d.xy, list: [d] });
-  }
-  for (const c of clusters) addDeathMark(c);
+                   died_xy: d.xy, step: d.grace_step || 0 }));
+  drawWorldMarks();
 }
 
-function drawRespawns() {
-  if (!state.respawns) return;
-  // Clustered like deaths, and for the same reason: dying twice to the same
-  // boss puts you back at the same grace twice, and two marks on one spot
-  // read as one.
-  const clusters = [];
-  for (const r of state.respawnList) {
-    if (!r.xy || !markPlane(r)) continue;
-    if (state.range && (r.ts < state.range[0] || r.ts > state.range[1])) continue;
-    if (hiddenInside(r)) continue;
-    const near = clusters.find(
-      (c) => Math.abs(c.xy[0] - r.xy[0]) < 12 && Math.abs(c.xy[1] - r.xy[1]) < 12);
-    if (near) near.list.push(r);
-    else clusters.push({ xy: r.xy, list: [r] });
+// How near two marks of one kind have to be to be one mark with a count.
+const CLUSTER_PX = 12;
+
+// And how near two marks of *different* kinds have to be before one is
+// hiding the other. Not the same number, which is what the first version
+// assumed: at twelve pixels two 24 px discs overlap by half and you can see
+// perfectly well that there are two of them, so splitting them into one mark
+// said they were in one place when they were merely near each other.
+//
+// Measured over the 329 marks on `routes.db`, every pair of different kinds
+// closer than 30 px: **21 pairs at 0.15 px or less** -- a grace you warp into
+// and get up at is the same recorded position, so those are exact -- then a
+// gap to 1.39, and from there 2.1, 2.5, 2.7, 2.8, 2.9, 3.2, 3.9, 4.0, 5.0,
+// 5.4, 5.7, 7.2 and up with nothing to separate them. So the threshold is
+// read off the mark rather than off the data: a quarter of the disc, which
+// is the point past which you can see that the thing behind is a second
+// mark rather than a rim.
+const SPLIT_PX = 6;
+
+// Everything within CLUSTER_PX of each other, as one entry with a count.
+// Written once because four different kinds of mark were each doing it, and
+// the spot register below is only sound while they all agree about what one
+// spot is.
+function clusterMarks(list, xyOf, px) {
+  const out = [];
+  const near_px = px || CLUSTER_PX;
+  for (const item of list) {
+    const p = xyOf(item);
+    const near = out.find((c) => Math.abs(c.xy[0] - p[0]) < near_px
+                              && Math.abs(c.xy[1] - p[1]) < near_px);
+    if (near) near.list.push(item);
+    else out.push({ xy: p, list: [item] });
   }
-  for (const c of clusters) addRespawnMark(c);
+  return out;
 }
 
-function addRespawnMark(c) {
-  const n = c.list.length;
-  const size = n > 1 ? 22 : 18;
-  const mark = L.marker(toLatLng(c.xy), {
-    pane: 'respawns',
-    icon: L.divIcon({
-      className: 'respawn-mark',
-      html: `<span>\u2739</span>${n > 1 ? `<i class="count">${n}</i>` : ''}`,
-      iconSize: [size, size],
-      iconAnchor: [size / 2, size / 2],
-    }),
-    keyboard: false,
+const inWindowTs = (ts) => !state.range
+  || (ts >= state.range[0] && ts <= state.range[1]);
+
+// Every mark on the world map, drawn together.
+//
+// Together because of what happens at a grace you keep coming back to: you
+// warp there and you get up there, so a teleport mark and a respawn mark land
+// on the same pixel and one is simply behind the other. Reported as exactly
+// that. Warping *out* of a grace you also warp *into* is the same collision
+// between two marks of one kind, and a death at one makes it three.
+//
+// They cannot be merged into a single mark, because each kind has its own
+// switch in the panel and has to be able to come off the map without taking
+// the others with it. So they step aside instead: marks that would stand on
+// each other are spread evenly around the point they share, and a mark with
+// the spot to itself -- which is nearly all of them -- does not move at all.
+//
+// One function rather than one per loader, because the answer depends on all
+// of them at once. Drawn from the three lists on `state`, so whichever fetch
+// came back last, the picture is the same.
+function drawWorldMarks() {
+  deathGroup.clearLayers();
+  respawnGroup.clearLayers();
+  warpGroup.clearLayers();
+  // Whatever was pinned was pinned to a mark that is about to be rebuilt, and
+  // may not be among the new ones at all -- a filter change is how a mark
+  // stops existing.
+  lines.pinned = false;
+  hideDeathLines();
+  hideWarpLines();
+
+  const wanted = [];
+  const want = (kind, clusters, end) => {
+    for (const c of clusters) wanted.push({ kind, c, end });
+  };
+  if (state.deaths) {
+    want('death', clusterMarks(
+      (state.deathList || []).filter(
+        (d) => d.xy && markPlane(d) && inWindowTs(d.ts) && !hiddenInside(d)),
+      (d) => d.xy));
+  }
+  if (state.respawns) {
+    want('respawn', clusterMarks(
+      (state.respawnList || []).filter(
+        (r) => r.xy && markPlane(r) && inWindowTs(r.ts) && !hiddenInside(r)),
+      (r) => r.xy));
+  }
+  for (const [kind, end] of [['warp', 'to'], ['warp', 'from']]) {
+    const list = warpEnds(end);
+    if (list) want(kind, clusterMarks(list, (w) => w[end === 'to' ? 'xy' : 'from_xy']), end);
+  }
+
+  // One mark each while they have the spot to themselves, which is nearly
+  // all of them; one mark between them when they do not. In the order the
+  // kinds are gathered above, so a cell keeps the same side from one redraw
+  // to the next rather than swapping when something else is toggled.
+  placeMarks(wanted.map(worldCell), deathGroup, 'deaths');
+  // The busiest teleport and the busiest grace are counted off these same
+  // lists, so they are worked out again whenever the lists change rather
+  // than once at boot, when neither had arrived yet.
+  renderStats();
+}
+
+/* --- the busiest places --------------------------------------------------
+
+   Which teleport you used most and which grace you got up at most, counted
+   the way the map counts its marks -- the same clustering at the same
+   radius -- so the number in the panel and the number on the badge are one
+   fact rather than two that can disagree.
+
+   In both coordinate spaces, because the answer lives in both. On routes.db
+   the busiest jump end is a grace in Limgrave with six ends on one point, and
+   the busiest respawn is 31 deep inside a catacomb, against 7 for the busiest
+   on the whole surface. A stat that counted only what has a world position
+   would have named the wrong place and then offered to take you to it.
+   ------------------------------------------------------------------------ */
+
+// A dungeon's own metres are the map's pixels once the drawing is
+// transformed, give or take the projection's scale: an interior frame is a
+// turn and a shift, never a stretch. So the box test inside one is
+// CLUSTER_PX / scale, which is the same question the drawing asks in pixels.
+function localClusterPx() {
+  const pr = state.meta.projection || {};
+  return CLUSTER_PX / (Math.abs(pr.scale_x) || 1);
+}
+
+// The fullest spot in a list of marks, wherever it is. World positions are
+// clustered together; everything inside a dungeon is clustered against the
+// other marks in that same dungeon and nothing else.
+//
+// Nothing is reported for a spot used once: every place you have ever warped
+// to is a place you warped to once, and "most used" for that is noise.
+function bestSpot(items) {
+  let best = null;
+  const keep = (clusters, map_id) => {
+    for (const c of clusters) {
+      if (!best || c.list.length > best.n) {
+        best = { n: c.list.length, at: c.xy, map_id, list: c.list };
+      }
+    }
+  };
+  keep(clusterMarks(items.filter((i) => !i.map_id), (i) => i.at), null);
+  const byMap = new Map();
+  for (const i of items) {
+    if (!i.map_id) continue;
+    if (!byMap.has(i.map_id)) byMap.set(i.map_id, []);
+    byMap.get(i.map_id).push(i);
+  }
+  for (const [map_id, list] of byMap) {
+    keep(clusterMarks(list, (i) => i.at, localClusterPx()), map_id);
+  }
+  return best && best.n > 1 ? best : null;
+}
+
+// Every end of every jump, each in the space it belongs to. Both ends count:
+// a grace you warp away from and come back to is one teleport you used twice,
+// and asking only about arrivals would say six places were used four times
+// when one of them was used six.
+function busiestWarp() {
+  const ends = [];
+  for (const w of (state.warpList || [])) {
+    if (w.local) ends.push({ at: w.local, map_id: w.map_id, which: 'to', w });
+    else if (w.xy) ends.push({ at: w.xy, map_id: null, which: 'to', w });
+    if (w.from_local) {
+      ends.push({ at: w.from_local, map_id: w.from_map_id, which: 'from', w });
+    } else if (w.from_xy) {
+      ends.push({ at: w.from_xy, map_id: null, which: 'from', w });
+    }
+  }
+  return bestSpot(ends);
+}
+
+function busiestRespawn() {
+  const list = [];
+  for (const r of (state.respawnList || [])) {
+    if (!inWindowTs(r.ts)) continue;
+    // The same rule the map draws by: a mark made inside a dungeon has only
+    // that dungeon's metres, and the `xy` beside them is its entrance.
+    if (r.layer === 'interior' && r.local) {
+      list.push({ at: r.local, map_id: r.map_id, r });
+    } else if (r.xy) {
+      list.push({ at: r.xy, map_id: null, r });
+    }
+  }
+  return bestSpot(list);
+}
+
+// What to call where it is. A jump carries the map it is in and no label, so
+// the name comes from the dungeon list, which is where the pins get theirs.
+function spotWhere(spot) {
+  const first = spot.list[0];
+  const item = first.w || first.r;
+  if (!spot.map_id) {
+    return first.which === 'from' ? item.from_map : item.map;
+  }
+  const label = state.dungeonName.get(spot.map_id);
+  const map = first.which === 'from' ? item.from_map : item.map;
+  return label ? `${label} (${map})` : map;
+}
+
+function warpSpotTitle(spot) {
+  const to = spot.list.filter((e) => e.which === 'to').length;
+  const from = spot.list.length - to;
+  const parts = [];
+  if (to) parts.push(`${to} arrived`);
+  if (from) parts.push(`${from} left from`);
+  return `${parts.join(', ')} - ${spotWhere(spot)}`
+    + '. Press to show it on the map.';
+}
+
+function respawnSpotTitle(spot) {
+  return `Got up here ${spot.n} times - ${spotWhere(spot)}`
+    + '. Press to show it on the map.';
+}
+
+// Take me there. A world spot is a place on the map and needs nothing but the
+// view; a spot inside a dungeon has no world position at all, so the place
+// has to be drawn first and the point read through the frame it is drawn in
+// -- which is the same thing hovering its pin does, pinned so it stays.
+async function goToSpot(spot) {
+  // Close enough to fill the screen with the place rather than the region.
+  const zoom = Math.max(map.getZoom(), state.nativeZoom);
+  if (!spot.map_id) {
+    const item = spot.list[0].w || spot.list[0].r;
+    if (item.plane && item.plane !== state.plane) selectPlane(item.plane);
+    map.setView(toLatLng(spot.at), zoom, { animate: false });
+    openMarkAt(spot.at, [deathGroup, respawnGroup, warpGroup]);
+    return;
+  }
+  // Fetched rather than remembered: this is one request on a press, and a
+  // kept list is a list that can be stale against the map.
+  let visits = [];
+  try {
+    const data = await (await fetch('/api/interiors')).json();
+    visits = (data.visits || []).filter((v) => v.map_id === spot.map_id);
+  } catch (e) { return; }
+  if (!visits.length) return;
+  if (visits[0].plane && visits[0].plane !== state.plane) {
+    selectPlane(visits[0].plane);
+  }
+  await showInside(visits, true);
+  const tf = inside.transform;
+  if (!tf || tf.map_id !== spot.map_id) return;
+  const at = tf.at(spot.at[0], spot.at[1]);
+  map.setView(toLatLng(at), zoom, { animate: false });
+  openMarkAt(at, [insideGroup, placedGroup]);
+}
+
+// And open the mark standing there, so the answer is the popup that names it
+// rather than a screen of discs with no way to tell which one was meant.
+function openMarkAt(xy, groups) {
+  let found = null;
+  const walk = (g) => g.eachLayer((l) => {
+    if (found) return;
+    if (l.eachLayer) return walk(l);
+    if (!l.getLatLng || !l.getPopup || !l.getPopup()) return;
+    const p = map.project(l.getLatLng(), state.nativeZoom);
+    if (Math.abs(p.x - xy[0]) <= SPLIT_PX && Math.abs(p.y - xy[1]) <= SPLIT_PX) {
+      found = l;
+    }
   });
+  for (const g of groups) { if (!found) walk(g); }
+  if (found) found.openPopup();
+}
+
+function respawnPopup(c) {
+  const n = c.list.length;
   const when = c.list.slice(0, 8).map(
     (r) => `${new Date(r.ts).toLocaleString()} - ${r.after_s}s after dying`
+      + (r.step ? ' <span class="hint">(moved by hand)</span>' : '')
   ).join('<br>');
   const more = n > 8 ? `<br>and ${n - 8} more` : '';
-  mark.bindPopup(
-    `<b>${n > 1 ? `Got up here ${n} times` : 'Got up here'}</b><br>` +
-    `${c.list[0].map}<br>${when}${more}`
-  );
-  // Hovering either end draws what it cost you, the way hovering a teleport
-  // draws the jump.
-  mark.on('mouseover', () => showDeathLines(
-    c.list.map((r) => ({ from: r.died_xy, to: r.xy })).filter((l) => l.from)));
-  mark.on('mouseout', hideDeathLines);
-  mark.addTo(respawnGroup);
+  const body = `<b>${n > 1 ? `Got up here ${n} times` : 'Got up here'}</b><br>`
+    + `${c.list[0].map}<br>${when}${more}`;
+  // The grace is the first load screen after the death, which is right
+  // almost always and cannot be right every time -- so where it is wrong,
+  // this is how you say so. Reported: a death at 17:27:06 whose grace was
+  // drawn at 17:27:21, still in the room it happened in, when the game had
+  // actually put the player somewhere else at 17:27:26. That reading carries
+  // a map change, which the rule refuses on purpose, so no amount of
+  // rule-tuning reaches it; see respawn_after() in store.py.
+  //
+  // One at a time. A cluster can hold a dozen graces and only you know which
+  // of them landed in the wrong place.
+  const one = n === 1 ? c.list[0] : null;
+  return one
+    ? popupWithAction(body, one.step ? 'Put the grace back'
+                                     : 'The grace is the next point',
+                      () => {
+                        map.closePopup();
+                        callGrace(one.died_ts, one.step ? 0 : one.step + 1);
+                      })
+    : asElement(body);
 }
 
 let deathLines = [];
+let deathHome = null;
 
-function showDeathLines(pairs) {
+// Dashed and in the death's own red, running from where you went down to
+// where you got up: the two marks are one event and the line is how far back
+// it put you.
+//
+// The pairs arrive already resolved to map pixels, and the group and the
+// renderer come with them, for the reason `showWarpLines()` takes them: a
+// mark drawn inside a dungeon is in that dungeon's own frame and belongs in
+// that dungeon's group, and only the caller is holding the frame. Without
+// this the world's death marks answered and the ones drawn inside a cave or
+// a castle had no hover at all -- reported as exactly that.
+function showDeathLines(pairs, into, lineRenderer) {
   hideDeathLines();
-  // Dashed and in the death's own red, running from where you went down to
-  // where you got up: the two marks are one event and the line is how far
-  // back it put you.
-  deathLines = pairs.map((l) => L.polyline(
-    [toLatLng(l.from), toLatLng(l.to)],
-    { renderer, color: '#ff8a72', weight: 2, opacity: 0.8, dashArray: '4,6' }
-  ).addTo(deathGroup));
+  deathHome = into || deathGroup;
+  deathLines = pairs
+    .filter((l) => l && l.from && l.to)
+    .map((l) => L.polyline(
+      [toLatLng(l.from), toLatLng(l.to)],
+      { renderer: lineRenderer || renderer, color: '#ff8a72', weight: 2,
+        opacity: 0.8, dashArray: '4,6' }
+    ).addTo(deathHome));
 }
 
 function hideDeathLines() {
-  for (const l of deathLines) deathGroup.removeLayer(l);
+  for (const l of deathLines) (deathHome || deathGroup).removeLayer(l);
   deathLines = [];
 }
 
-function addDeathMark(c) {
+// One end of a death line, in whatever frame it belongs to. Inside the
+// dungeon being drawn it is that dungeon's own metres through `at`; out on
+// the surface it is a recorded world position, which is the same pixels once
+// projected; and inside some other dungeon it is that dungeon's pin, because
+// an interior position is in no frame this drawing can reach.
+function markEndAt(map_id, local, xy, v, at) {
+  if (local && map_id === v.map_id) return at(local[0], local[1]);
+  if (xy) return xy;
+  if (local && state.dungeonAt.has(map_id)) return state.dungeonAt.get(map_id);
+  return null;
+}
+
+function deathPopup(c) {
   const n = c.list.length;
-  const size = n > 1 ? 22 : 18;
-  const mark = L.marker(toLatLng(c.xy), {
-    pane: 'deaths',
-    icon: L.divIcon({
-      className: 'death-mark',
-      html: `<span>\u2715</span>${n > 1 ? `<i class="count">${n}</i>` : ''}`,
-      iconSize: [size, size],
-      iconAnchor: [size / 2, size / 2],
-    }),
-    keyboard: false,
-  });
   const first = c.list[0];
   const where = first.layer === 'interior'
     ? `Inside ${first.label} (${first.map}) - hover the dungeon to see where`
@@ -2516,16 +3366,12 @@ function addDeathMark(c) {
         `${Math.round(metresBetween(c.xy, back[0].respawn.xy))} m away</span>`
       : '');
   const mine = c.list.filter((d) => d.by_hand);
-  mark.bindPopup(mine.length === 1 && n === 1
+  return mine.length === 1 && n === 1
     ? popupWithAction(html + '<br><span class="hint">You marked this one.</span>',
                       'Not a death after all',
                       () => { map.closePopup();
                               callDeath({ ts: mine[0].ts, clear: true }); })
-    : html);
-  mark.on('mouseover', () => showDeathLines(
-    back.map((d) => ({ from: c.xy, to: d.respawn.xy }))));
-  mark.on('mouseout', hideDeathLines);
-  mark.addTo(deathGroup);
+    : asElement(html);
 }
 
 // Map pixels back to metres, so a popup can say how far back dying put you
@@ -2561,71 +3407,328 @@ async function loadWarps() {
   // deaths have always applied it.
   state.warpList = data.warps.filter(
     (w) => !state.range || (w.ts >= state.range[0] && w.ts <= state.range[1]));
-  if (!state.warps) return;
+  // Both ends, and every other kind of mark with them: where you went is
+  // only half of a teleport, and a grace you warp to is usually a grace you
+  // get up at, so the two would be drawn on the same pixel if each loader
+  // drew its own.
+  drawWorldMarks();
+}
+
+// Which jumps have an end to draw out here, or null when the layer is off.
+// Split from the drawing so drawWorldMarks() can see every kind of mark at
+// once and tell which of them are standing on each other.
+function warpEnds(end) {
+  if (!state.warps) return null;
   // An end inside a dungeon is drawn on the world map at that dungeon's pin,
   // for want of anywhere better -- which is the right answer while the place
   // itself is not on the screen, and the wrong one when it is. A legacy
-  // dungeon is drawn in the open at all times and now carries that end where
-  // it actually happened, so the stand-in comes off: 13 of the 20 jumps with
-  // an end inside a dungeon are into or out of one of those, and they would
-  // otherwise wear two marks for one event a few hundred metres apart. A
-  // cave needs no rule -- its drawing only appears while you hover it, and
-  // hovering dims the world's marks anyway.
-  const shown = (w, end) => {
+  // dungeon is drawn in the open at all times and carries that end where it
+  // actually happened, so the stand-in comes off.
+  const shown = (w) => {
     const inside = end === 'to' ? w.local : w.from_local;
     const map_id = end === 'to' ? w.map_id : w.from_map_id;
     return !(inside && state.alwaysDrawn && state.alwaysDrawn.has(map_id));
   };
-  const outside = state.warpList.filter((w) => !w.inside && markPlane(w));
-  // Both ends: where you went is only half of a teleport, and a mark only at
-  // the arrival leaves the other end of the jump unaccounted for.
-  addWarpMarks(outside.filter((w) => shown(w, 'to')), 'to');
-  addWarpMarks(outside.filter((w) => shown(w, 'from')), 'from');
+  return (state.warpList || []).filter(
+    (w) => !w.inside && markPlane(w) && shown(w));
 }
 
-function addWarpMarks(warps, end) {
-  const at = end === 'to' ? 'xy' : 'from_xy';
-  // Warping out of the same grace a dozen times is normal, so the ends are
-  // clustered the way deaths are rather than stacked into one unreadable pile.
-  const clusters = [];
-  for (const w of warps) {
-    const p = w[at];
-    const near = clusters.find(
-      (c) => Math.abs(c.xy[0] - p[0]) < 12 && Math.abs(c.xy[1] - p[1]) < 12);
-    if (near) near.list.push(w);
-    else clusters.push({ xy: p, list: [w] });
-  }
+function warpMarkPopup(c, end) {
+  // Without the HP reading a death and a teleporter are the same event, so
+  // the tracker draws a teleport and offers to be corrected rather than
+  // guessing. One jump at a time: a cluster can hold several, and only you
+  // know which of them killed you.
+  return c.list.length === 1
+    ? popupWithAction(warpPopup(c.list, end), 'This was a death',
+                      () => { map.closePopup(); callDeath({ ts: c.list[0].ts, from_ts: c.list[0].from_ts }); })
+    : asElement(warpPopup(c.list, end));
+}
 
-  for (const c of clusters) {
-    const n = c.list.length;
-    const size = n > 1 ? 22 : 18;
-    const mark = L.marker(toLatLng(c.xy), {
-      pane: 'warps',
-      icon: L.divIcon({
-        className: end === 'to' ? 'warp-mark' : 'warp-mark warp-from',
-        html: `<span>${end === 'to' ? '\u2726' : '\u2727'}</span>` +
-              (n > 1 ? `<i class="count">${n}</i>` : ''),
-        iconSize: [size, size],
-        iconAnchor: [size / 2, size / 2],
-      }),
-      keyboard: false,
-    });
-    // Without the HP reading a death and a teleporter are the same event, so
-    // the tracker draws a teleport and offers to be corrected rather than
-    // guessing. One jump at a time: a cluster can hold several, and only you
-    // know which of them killed you.
-    mark.bindPopup(c.list.length === 1
-      ? popupWithAction(warpPopup(c.list, end), 'This was a death',
-                        () => { map.closePopup(); callDeath({ ts: c.list[0].ts, from_ts: c.list[0].from_ts }); })
-      : warpPopup(c.list, end));
-    // Hovering either end draws the jump itself, so the pair reads as one
-    // event rather than two unrelated marks.
-    mark.on('mouseover', () => showWarpLines(
-      c.list.map((w) => [w.from_xy, w.xy])));
-    mark.on('mouseout', hideWarpLines);
-    mark.addTo(warpGroup);
+/* --- one mark, or one mark split ----------------------------------------
+
+   A grace you keep warping back to is a grace you keep getting up at, so a
+   teleport mark and a respawn mark land on the same pixel. They were drawn by
+   separate loaders that knew nothing about each other, so one was simply
+   behind the other; then they were nudged apart, which worked and read as two
+   places rather than as one place with two things to say about it.
+
+   Asked for instead: "a split symbol, with one symbol on each side. Hovering
+   over it should show the dashed line for both the teleport and death." So a
+   shared spot is one marker -- a pill divided into a cell per kind, each cell
+   keeping its own glyph and its own colour, with the pill's outline split
+   between them. It sits exactly on the point, which is the thing a nudge
+   could not do.
+
+   What made this possible is drawWorldMarks(): every kind is built in one
+   pass from the three lists, so a switch coming off simply rebuilds the spot
+   with one fewer cell. That was the objection to merging them before.
+
+   A *cell* is what one kind has to say at one point -- its face, its count,
+   its popup and the lines it draws while you point at it -- and it is the
+   only thing placeMarks() knows about. The world builds them from its three
+   lists; drawInteriorInto() builds them from the visit it is drawing, in
+   that dungeon's own frame. Which is the half that was missing: a dungeon's
+   marks are drawn by nobody but that function, so they went on stacking
+   exactly the way the world's used to. Reported as "the split markers don't
+   seem to work in legacy dungeons at least".
+   ------------------------------------------------------------------------ */
+
+// What one kind has to say about a spot: its face, its popup, and the lines
+// it draws while you point at it. One place, so a cell of a split and a mark
+// on its own cannot drift apart.
+function markFace(m) {
+  if (m.kind === 'death') return { cls: 'death', glyph: '\u2715' };
+  if (m.kind === 'respawn') return { cls: 'respawn', glyph: '\u2739' };
+  return m.end === 'to'
+    ? { cls: 'warp', glyph: '\u2726' }
+    : { cls: 'warp warp-from', glyph: '\u2727' };
+}
+
+function markPopupEl(m) {
+  if (m.kind === 'death') return deathPopup(m.c);
+  if (m.kind === 'respawn') return respawnPopup(m.c);
+  return warpMarkPopup(m.c, m.end);
+}
+
+// The dashed lines this mark answers with. Gathered rather than drawn,
+// because a split has to make one call per kind of line: showDeathLines()
+// clears the last set before drawing, so a death cell and a respawn cell
+// each calling it would leave only the second.
+function markLines(m) {
+  if (m.kind === 'death') {
+    return { deaths: m.c.list.filter((d) => d.respawn && d.respawn.xy)
+                       .map((d) => ({ from: m.c.xy, to: d.respawn.xy })) };
+  }
+  if (m.kind === 'respawn') {
+    return { deaths: m.c.list.map((r) => ({ from: r.died_xy, to: r.xy }))
+                       .filter((l) => l.from) };
+  }
+  return { warps: m.c.list.map((w) => [w.from_xy, w.xy]) };
+}
+
+function asElement(html) {
+  const el = document.createElement('div');
+  el.innerHTML = html;
+  return el;
+}
+
+// One cluster of one kind, as a cell: where it is, what it looks like, what
+// it says and what it draws. The world's marks come through here so that a
+// cell of a split and a mark standing on its own cannot say different things
+// about the same cluster.
+function worldCell(m) {
+  const face = markFace(m);
+  const lines = markLines(m);
+  return {
+    xy: m.c.xy, cls: face.cls, glyph: face.glyph, n: m.c.list.length,
+    popup: markPopupEl(m),
+    deaths: lines.deaths || [], warps: lines.warps || [],
+    group: GROUP_OF[m.kind], pane: PANE_OF[m.kind],
+    // Both ends of a jump are the same kind of thing at the same place; see
+    // mergeFamilies() below.
+    family: m.kind === 'warp' ? 'warp' : null,
+  };
+}
+
+// Which cells are standing on each other, and then a marker each or a marker
+// between them.
+//
+// One function for the world map and for the inside of a dungeon, because a
+// register is only sound while everything that can land on a point is asked
+// about at once -- which is the reason the world's three loaders were brought
+// together in the first place, and the reason a castle's own marks, drawn by
+// nobody else, went on stacking after they were.
+//
+// The split goes in the group and pane the caller names: out on the world
+// that is the topmost of the three mark panes, so a split is never behind a
+// single mark of one of the kinds inside it; inside a dungeon it is that
+// dungeon's own group, which is what makes it come and go with the drawing.
+function placeMarks(cells, splitGroup, splitPane) {
+  const spots = [];
+  for (const c of cells) {
+    const near = spots.find((sp) => Math.abs(sp.xy[0] - c.xy[0]) < SPLIT_PX
+                                 && Math.abs(sp.xy[1] - c.xy[1]) < SPLIT_PX);
+    if (near) near.cells.push(c);
+    else spots.push({ xy: c.xy, cells: [c] });
+  }
+  for (const sp of spots) {
+    const cells = mergeFamilies(sp.cells);
+    if (cells.length === 1) addSingleMark(cells[0]);
+    else addSplitMark({ xy: sp.xy, cells }, splitGroup, splitPane);
   }
 }
+
+// Two ends of one family are one cell. Both ends of a jump are the same thing
+// -- a teleport at this place -- and a grace you warp away from is usually one
+// you warp back to, so the pair landed on one spot constantly and was drawn as
+// two cells saying the same word twice: the bright arrival beside the dim
+// departure. With a respawn there as well that made a three-cell pill where a
+// disc would do. Asked for: "make both teleport markers into one, since you
+// can see where they go to and from by hovering."
+//
+// Which is the argument for doing it wherever they meet rather than only at
+// three deep: hovering draws every jump at the spot in both directions, and
+// the popup keeps the two sections it always had.
+//
+// The face is the first cell gathered, and the gather order is arrival then
+// departure -- so a place you both arrive at and leave from wears the bright
+// face, and one you only ever left from keeps the dim one. The count is every
+// end at the spot, which is the number the panel's "most used teleport"
+// reports for the same place.
+function mergeFamilies(cells) {
+  const out = [];
+  for (const c of cells) {
+    const into = c.family && out.find((o) => o.family === c.family);
+    if (!into) { out.push(Object.assign({}, c)); continue; }
+    into.n += c.n;
+    into.parts = (into.parts || [into.popup]).concat([c.popup]);
+    into.deaths = (into.deaths || []).concat(c.deaths || []);
+    into.warps = (into.warps || []).concat(c.warps || []);
+  }
+  for (const c of out) if (c.parts) c.popup = popupBox(c.parts);
+  return out;
+}
+
+// Several things to say at one place, with a rule between so the sections do
+// not run together.
+function popupBox(parts) {
+  const box = document.createElement('div');
+  for (const p of parts) {
+    if (!p) continue;
+    if (box.childNodes.length) box.appendChild(document.createElement('hr'));
+    box.appendChild(typeof p === 'string' ? asElement(p) : p);
+  }
+  return box;
+}
+
+// Pointing at a mark draws everything it has to say, whether that is one
+// kind or three. The lines are gathered rather than drawn as each cell is
+// read, because showDeathLines() clears the last set before drawing a new
+// one: a death cell and a respawn cell each calling it would leave only the
+// second on the map.
+//
+// Where they are drawn comes from the cells, and every cell of one spot is
+// from one drawing: a line in a dungeon's own frame belongs in that
+// dungeon's group, and only the drawing is holding the frame.
+function wireMarkHover(mark, cells) {
+  const deaths = [];
+  const warps = [];
+  for (const c of cells) {
+    if (c.deaths) deaths.push(...c.deaths);
+    if (c.warps) warps.push(...c.warps);
+  }
+  const into = cells[0].lineGroup;
+  const lineRenderer = cells[0].lineRenderer;
+  const draw = () => {
+    if (deaths.length) showDeathLines(deaths, into, lineRenderer);
+    if (warps.length) showWarpLines(warps, into, lineRenderer);
+  };
+  // Pointing at a mark asks the question; the answer goes away when you stop
+  // pointing. Unless one is pinned, in which case a cursor sweeping over the
+  // map on its way somewhere -- which is what a drag is -- must not take it
+  // down or replace it. The dungeon overlay has had exactly this rule since
+  // it was written.
+  mark.on('mouseover', () => { if (!lines.pinned) draw(); });
+  mark.on('mouseout', () => {
+    if (!lines.pinned) { hideDeathLines(); hideWarpLines(); }
+  });
+  // And clicking means keep it. Asked for: "clicking on a marker should make
+  // the path from one marker to another persist on screen even when panning."
+  //
+  // Hung on the popup rather than on the click, because the popup is already
+  // the thing that says which mark you are looking at: Leaflet opens it on
+  // the click, closes it when you click the map or press Escape, and swaps it
+  // when you click another mark -- so the lines follow all three without a
+  // second set of rules to keep in step. Clicking the same mark again closes
+  // its popup, which puts them away.
+  mark.on('popupopen', () => {
+    // A mark inside a cave is drawn on a drawing that only exists while you
+    // are pointing at it, and the lines are in that drawing's own group. Pin
+    // it too, or panning away takes the cave down and the lines with it. A
+    // castle needs none of this: it is on the map at all times.
+    if (into === insideGroup) inside.pinned = true;
+    lines.pinned = false;
+    draw();
+    lines.pinned = true;
+  });
+  mark.on('popupclose', () => {
+    lines.pinned = false;
+    hideDeathLines();
+    hideWarpLines();
+  });
+}
+
+// Whether the lines on screen were asked for by a click rather than by a
+// cursor passing over. One flag for both kinds, because they are one answer:
+// a spot can hold a death and a teleport, and pinning half of it would be a
+// strange thing to look at.
+const lines = { pinned: false };
+
+const MARK_PX = 18;
+
+function addSingleMark(c) {
+  const size = c.n > 1 ? 22 : MARK_PX;
+  const mark = L.marker(toLatLng(c.xy), {
+    pane: c.pane,
+    icon: L.divIcon({
+      className: `${c.cls === 'warp warp-from' ? 'warp-mark warp-from'
+                    : c.cls + '-mark'}`,
+      html: `<span>${c.glyph}</span>`
+            + (c.n > 1 ? `<i class="count">${c.n}</i>` : ''),
+      iconSize: [size, size],
+      iconAnchor: [size / 2, size / 2],
+    }),
+    keyboard: false,
+  });
+  if (c.popup) mark.bindPopup(c.popup);
+  wireMarkHover(mark, [c]);
+  mark.addTo(c.group);
+}
+
+// The width of one half of a split mark. Two of them make a disc the size of
+// a single mark with a count on it; a third would make a pill, and at
+// SPLIT_PX there is no third -- the triples only appear at eight pixels and
+// above, so every split on `routes.db` is a disc cut down the middle.
+const SPLIT_CELL = 12;
+
+// Two or more kinds at one place: one marker, a cell each.
+//
+// A cell was as wide as the thing in it -- 20 px, or 26 with a count beside
+// the glyph -- which made a pair 40 to 52 px and a triple 72, a lozenge lying
+// across the terrain next to marks a third of its size. Reported as exactly
+// that. The counts move out to the corners the single marks put them in, and
+// what is left is the glyph, so a cell is half a disc and a pair is a disc.
+function addSplitMark(spot, group, pane) {
+  const cells = spot.cells;
+  const width = SPLIT_CELL * cells.length;
+  const html = cells.map(
+    (c) => `<i class="half ${c.cls}" style="flex:0 0 ${SPLIT_CELL}px">`
+           + `<span>${c.glyph}</span>`
+           + (c.n > 1 ? `<i class="count">${c.n}</i>` : '') + '</i>').join('');
+  const mark = L.marker(toLatLng(spot.xy), {
+    pane,
+    icon: L.divIcon({
+      className: 'split-mark',
+      html,
+      iconSize: [width, SPLIT_CELL * 2],
+      iconAnchor: [width / 2, SPLIT_CELL],
+    }),
+    keyboard: false,
+  });
+  // Everything the spot has to say, in the order the kinds are gathered.
+  mark.bindPopup(popupBox(cells.map((c) => c.popup)));
+  wireMarkHover(mark, cells);
+  // Cleared with the rest on every redraw, so which group it lives in is
+  // only a question of z-order.
+  mark.addTo(group);
+}
+
+const PANE_OF = { death: 'deaths', respawn: 'respawns', warp: 'warps' };
+const GROUP_OF = {
+  get death() { return deathGroup; },
+  get respawn() { return respawnGroup; },
+  get warp() { return warpGroup; },
+};
 
 function warpPopup(list, end) {
   const n = list.length;
@@ -2644,6 +3747,36 @@ function warpPopup(list, end) {
   // the third one silently reads as the second.
   const why = list[0].reason;
   return `<b>${title}</b><br>${rows}${more}<br><span class="hint">${why}</span>`;
+}
+
+// Move one death's grace along, or put it back. Everything downstream of it
+// -- the mark, the line to it, the dungeon it may be drawn in -- comes from
+// the death list, so refetching that is the whole of the redraw.
+async function callGrace(ts, step) {
+  try {
+    const res = await fetch('/api/grace', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ts, step }),
+    });
+    const d = await res.json();
+    if (!res.ok || !d.ok) {
+      setStats(d.error || 'The recorder would not change that.');
+      return null;
+    }
+    await loadDeaths();
+    // The path is untouched -- moving a grace moves no breaks -- but the
+    // playback's script carries the respawn as an event of its own, so it
+    // has to be built again and re-seeked to where you were watching.
+    if (play.on) { await playRebuild(playClock(play.at)); return d; }
+    if (inside.key && inside.last) {
+      await showInside(inside.last.group, inside.pinned, inside.last.only);
+    }
+    return d;
+  } catch (e) {
+    setStats('Could not reach the recorder to change that.');
+    return null;
+  }
 }
 
 async function callDeath(body) {
@@ -2710,10 +3843,41 @@ function showWarpLines(pairs, into, lineRenderer) {
   warpHome = into || warpGroup;
   warpLines = pairs
     .filter(([a, b]) => a && b)
-    .map(([a, b]) => L.polyline([toLatLng(a), toLatLng(b)], {
-      renderer: lineRenderer || renderer,
-      color: '#8fb7cc', weight: 2, opacity: 0.75, dashArray: '5,7',
-    }).addTo(warpHome));
+    .map(([a, b]) => L.polyline([toLatLng(a), toLatLng(b)], jumpLine(lineRenderer))
+      .addTo(warpHome));
+}
+
+// A dashed line that moves has to be drawn as SVG. The canvas renderer has no
+// dash offset to animate, and stepping one by hand would mean repainting the
+// canvas it shares -- which for a jump on the world map is the whole route,
+// sixty times a second, to shift a few dashes. One SVG renderer per pane the
+// jump lines are drawn in, made the first time it is wanted and kept: there
+// are never more than a handful of these paths at once, which is the size SVG
+// is good at.
+const dashPanes = new Map();
+
+function dashesIn(lineRenderer) {
+  const pane = (lineRenderer && lineRenderer.options && lineRenderer.options.pane)
+    || 'overlayPane';
+  if (!dashPanes.has(pane)) dashPanes.set(pane, L.svg({ pane, padding: 0.5 }));
+  return dashPanes.get(pane);
+}
+
+// Every dashed line between two ends of a jump, drawn the same way wherever it
+// is: out on the world map, inside the dungeon being hovered, or across a
+// castle that is drawn in the open. The pair is always [where you left, where
+// you arrived], and the dashes run from the first point to the last, so the
+// line says which way the jump went rather than only which two places it
+// joined.
+function jumpLine(lineRenderer) {
+  return {
+    renderer: dashesIn(lineRenderer),
+    className: 'jump-line',
+    // Nothing is bound to it, and a line lying across the map should not be
+    // able to take a click meant for whatever is under it.
+    interactive: false,
+    color: '#8fb7cc', weight: 2, opacity: 0.75, dashArray: '5,7',
+  };
 }
 
 function hideWarpLines() {
@@ -2843,6 +4007,27 @@ function insetOffMap(v) {
   box.replaceChildren(...out);
 }
 
+async function resetPlacement(map_id, label) {
+  try {
+    const res = await fetch('/api/place', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ map_id, clear: true }),
+    });
+    const d = await res.json();
+    if (!res.ok || !d.ok) {
+      setStats(d.error || 'The recorder would not forget that position.');
+      return;
+    }
+  } catch (e) {
+    setStats('Could not reach the recorder to forget that position.');
+    return;
+  }
+  state.dungeonFrame.delete(map_id);
+  setStats(`${label} placed from the recording again.`);
+  await afterPlacing();
+}
+
 async function unplaceDungeon(map_id, label) {
   try {
     const res = await fetch('/api/place', {
@@ -2874,6 +4059,7 @@ const placing = { map_id: null, label: '' };
 
 function startPlacing(v) {
   placing.map_id = v.map_id;
+  placing.visit = v;
   placing.label = `${v.label} (${v.map})`;
   document.getElementById('map').classList.add('placing');
   setCaption(`Click where ${placing.label} belongs. Escape to cancel; you ` +
@@ -2893,12 +4079,13 @@ async function placeAt(latlng) {
   const wz = (px.y - pr.offset_y) / pr.scale_y;
   const map_id = placing.map_id;
   const label = placing.label;
+  const local = placing.visit ? await handBase(placing.visit) : null;
   stopPlacing();
   try {
     const res = await fetch('/api/place', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ map_id, wx, wz }),
+      body: JSON.stringify({ map_id, wx, wz, local }),
     });
     const d = await res.json();
     if (!res.ok || !d.ok) {
@@ -3100,6 +4287,17 @@ function connectLive() {
   ws.onmessage = (ev) => {
     const s = JSON.parse(ev.data);
 
+    // The newest thing recorded is what the age ramp is measured back from,
+    // and that is true wherever you are standing. This lived in the branch
+    // that handles a sample with a world position, so the near end of the
+    // gradient froze the moment you walked into a dungeon: every sample
+    // inside was then newer than the newest end, clamped to the top of the
+    // ramp, and an hour in a castle was drawn entirely in the newest colour
+    // with the horizon slider having nothing to bite on.
+    if (typeof s.t === 'number' && state.span && s.t > state.span[1]) {
+      state.span[1] = s.t;
+    }
+
     if (s.type === 'death') {
       // Refetched rather than drawn from the message: deaths in the same spot
       // are clustered into one mark with a count, and that is the server's
@@ -3135,10 +4333,28 @@ function connectLive() {
         setYouMark(toLatLng(inside.transform.at(s.local[0], s.local[1])), null);
         // A load screen inside a dungeon is a death or a lift, and the line
         // should break there rather than being drawn through the rock.
-        if (s.break) state.liveInside.push(null);
+        if (s.break) { state.liveInside.push(null); state.liveInsideT.push(null); }
         state.liveInside.push(s.local);
-        if (state.liveInside.length > 4000) state.liveInside.shift();
+        state.liveInsideT.push(s.t);
+        if (state.liveInside.length > 4000) {
+          // The cut has to take the moments with it, or the tail is banded
+          // and trimmed against the wrong timestamps.
+          state.liveInside.shift();
+          state.liveInsideT.shift();
+        }
         redrawLiveInside();
+        // The ramp's newest end moves on every sample wherever you are
+        // standing, and nothing was bringing the colours up to date while
+        // that end was inside a dungeon: this call lives in the branch that
+        // handles a sample with a world position, which an interior sample
+        // is not.
+        recolourRoute();
+        // It rebuilds the surface tail on the way past, and that ends by
+        // naming its last run as the one to append to. Nulled again for the
+        // reason it is nulled above: the first sample after you come out
+        // must start a line of its own rather than be joined to where you
+        // were standing when you went in.
+        state.liveLayer = null;
       }
       return;
     }
@@ -3194,12 +4410,10 @@ function connectLive() {
     }
     state.live.push(here);
     state.liveT.push(s.t);
-    // The newest thing drawn on the map is now this sample, and the newest
-    // thing drawn is exactly what the age ramp is measured back from -- the
-    // wall clock is deliberately not used, or the whole route would slide into
-    // the oldest colour whenever the recorder was off. Without this line the
-    // near end of the gradient stayed wherever the last refetch put it.
-    if (state.span && s.t > state.span[1]) state.span[1] = s.t;
+    // The newest end of the ramp is advanced at the top of this handler, for
+    // every kind of sample: the wall clock is deliberately not used, or the
+    // whole route would slide into the oldest colour whenever the recorder
+    // was off.
     // The head follows the feed at once. The banding behind it is a second
     // stale at worst, which is the recolour tick. A break is the one thing
     // that cannot be appended to: the run it closed stays where it is and the
@@ -3388,6 +4602,21 @@ function boxOf(xy, start, stop, tf) {
   return [x0, y0, x1, y1];
 }
 
+// What a run is drawn at now, rather than what it was built at. The
+// panel's sliders are live while the playback runs, and a value baked
+// into the script at build time cannot follow them.
+function playWeight(run) {
+  return Math.max(0.5, state.weight - (run.under ? 0.5 : 0));
+}
+
+// The one an earlier visit is drawn at, and the one the open run is:
+// both here, so the restyle below and the drawing agree.
+function playLineWeight(run, open, faint) {
+  const w = playWeight(run);
+  if (faint && !open) return Math.max(1, w - 0.5);
+  return open ? w : w + 0.6;
+}
+
 function playRuns(segments, where, tf, lo, hi, plane) {
   const out = [];
   for (const seg of segments) {
@@ -3416,6 +4645,15 @@ function playRuns(segments, where, tf, lo, hi, plane) {
           // can be renormalised against the playhead rather than against the
           // end of a route the playback has not reached yet.
           rank: ageRank(seg.t[stop - 1]),
+          // Which plane's thickness it takes; the value itself is read
+          // at draw time so the slider can move under it.
+          under,
+          // Which session this stretch was recorded in. The route is cut
+          // at the session boundary server-side, so this is recorded
+          // rather than worked out from the clock -- which cannot answer
+          // it, since an imported afternoon and the live session covering
+          // it overlap.
+          session: seg.session,
           // The box it occupies, so hovering can rule a run out without
           // looking at any of its points.
           box: boxOf(seg.xy, start, stop, tf),
@@ -3486,23 +4724,50 @@ function playEvents(frames) {
     }
   }
   for (const w of (state.warpList || [])) {
-    if (w.inside) {
-      const hit = playVisitAt(frames, w.map_id, w.ts);
-      if (!hit || !w.local) continue;
-      out.push({ ts: w.ts, kind: 'warp', where: hit.key, label: w.map,
-                 from: hit.f.tf(w.from_local[0], w.from_local[1]),
-                 xy: hit.f.tf(w.local[0], w.local[1]), plane: hit.f.plane,
-                 // Carried so the popup can say this was a death: the jump
-                 // is what gets marked, and a transit's departure is not
-                 // the row before its arrival.
-                 from_ts: w.from_ts,
-                 distance_m: w.distance_m, reason: w.reason });
-    } else if (w.xy) {
-      out.push({ ts: w.ts, kind: 'warp', where: 'world', label: w.map,
-                 from: w.from_xy, xy: w.xy, plane: planeOf(w.layer),
-                 from_ts: w.from_ts,
-                 distance_m: w.distance_m, reason: w.reason });
-    }
+    // Each end in its own frame, resolved on its own moment.
+    //
+    // This used to ask one question -- `w.inside`, which means *both* ends
+    // in one dungeon -- and send everything else to the world plane on
+    // `w.xy`. For a gate, `w.xy` is the dungeon's **pin**: /api/warps has no
+    // other way to say where an end inside a dungeon is, so it hands back
+    // the place the marker stands. Reported from the field: "when I
+    // teleported into a legacy dungeon, it showed that I teleported to the
+    // entrance, but I actually teleported inside." The arrival's own local
+    // position was in the payload the whole time, which is the same thing
+    // the finished map was fixed for and the playback never was.
+    //
+    // The rule right above `planeOf()` says it outright: never fall back to
+    // the world position for a mark made inside, because that position is
+    // the entrance.
+    const inHit = w.local ? playVisitAt(frames, w.map_id, w.ts) : null;
+    const outHit = w.from_local
+      ? playVisitAt(frames, w.from_map_id, w.from_ts) : null;
+    const to = inHit ? inHit.f.tf(w.local[0], w.local[1]) : w.xy;
+    const from = outHit ? outHit.f.tf(w.from_local[0], w.from_local[1])
+                        : w.from_xy;
+    if (!to || !from) continue;
+    // The place the playback has to be standing in to draw this is the place
+    // the jump *arrives* in -- after a jump you are at the far end. Leaving a
+    // dungeon through a gate therefore belongs to the world.
+    //
+    // Which leaves the departure in a place of its own, and it needs saying
+    // where that is: a jump out of a cave has a departure in the cave's own
+    // frame, and that frame is on the screen only while the cave is drawn.
+    // `from_where` is the place it belongs to and `from_pin` is what the map
+    // itself falls back to when the place is not on screen -- the dungeon's
+    // marker, which is the server's own stand-in for an end it cannot put a
+    // world position on.
+    out.push({ ts: w.ts, kind: 'warp',
+               where: inHit ? inHit.key : 'world', label: w.map,
+               from, xy: to,
+               from_where: outHit ? outHit.key : 'world',
+               from_pin: w.from_xy,
+               plane: inHit ? inHit.f.plane : planeOf(w.layer),
+               // Carried so the popup can say this was a death: the jump
+               // is what gets marked, and a transit's departure is not
+               // the row before its arrival.
+               from_ts: w.from_ts,
+               distance_m: w.distance_m, reason: w.reason });
   }
   // A cave appears when you first go into it. The pins used to stand on the
   // map from the first frame of the playback, which gives away every place
@@ -3804,8 +5069,16 @@ function playAgeAt(run) {
 // is continuous here, and the only quantisation left is the eight bits the
 // colour is written in.
 function playColour(run) {
-  return state.tint === 'age' && run.rank !== undefined
-    ? ageColor(playAgeAt(run)) : run.colour;
+  if (state.tint === 'age' && run.rank !== undefined) {
+    return ageColor(playAgeAt(run));
+  }
+  // Read now rather than baked in, so the colour picker reaches a
+  // playback that is already running. The bands cannot be: which band a
+  // stretch falls in is decided when the script is built.
+  if (state.tint === 'solid') {
+    return run.under ? shade(state.colour, -0.35) : state.colour;
+  }
+  return run.colour;
 }
 
 // Bring the drawn stretches up to date with where the playhead is. Only worth
@@ -3847,7 +5120,7 @@ function playLine(run, upto, faint, tip) {
     renderer: open ? renderer : insideRenderer,
     pane: open ? undefined : 'inside',
     color: playColour(run),
-    weight: open ? run.weight : run.weight + 0.6,
+    weight: playLineWeight(run, open, faint),
     opacity: 0.95,
     lineJoin: 'round',
     lineCap: 'round',
@@ -3855,14 +5128,67 @@ function playLine(run, upto, faint, tip) {
   // An earlier run through the same place: there to be recognised, not
   // followed, so it goes under the one being walked rather than competing
   // with it. Never for a legacy dungeon, whose path is simply the map's.
-  if (faint && !open) {
-    style.weight = Math.max(1, run.weight - 0.5);
-    style.opacity = 0.4;
+  if (faint && !open) style.opacity = 0.4;
+  // The outline, laid down before the line it belongs to so it lands
+  // underneath -- the same way the route on the map draws its own.
+  let casing = null;
+  if (state.casing > 0) {
+    casing = L.polyline(pts, {
+      renderer: style.renderer,
+      pane: style.pane,
+      color: '#0d0b08',
+      weight: style.weight + state.casing,
+      opacity: 0.55,
+      lineJoin: 'round',
+      lineCap: 'round',
+    });
+    casing.addTo(open ? play.group : insideGroup);
   }
   const line = L.polyline(pts, style);
   line.addTo(open ? play.group : insideGroup);
-  play.lines.push({ run, line, colour: style.color });
+  // `open` and `faint` with it: the restyle has to arrive at the same
+  // width this did, and neither can be worked out from the run alone.
+  play.lines.push({ run, line, casing, colour: style.color, open, faint });
+  line._casing = casing;
   return line;
+}
+
+// The panel's look controls, while the playback has the map.
+//
+// Thickness, outline and the solid colour are a restyle of what is
+// already drawn. The bands are not: which band a stretch falls in is
+// decided when the script is built, so a change of ramp rebuilds it --
+// debounced, because a slider fires per pixel and a rebuild is a fetch.
+function playRestyle() {
+  let gone = 0;
+  for (const item of play.lines) {
+    if (!item.line._map) { gone++; continue; }
+    const w = playLineWeight(item.run, item.open, item.faint);
+    item.colour = playColour(item.run);
+    item.line.setStyle({ weight: w, color: item.colour });
+    if (item.casing) item.casing.setStyle({ weight: w + state.casing });
+  }
+  if (gone) play.lines = play.lines.filter((i) => i.line._map);
+}
+
+function playLookChanged(key) {
+  if (key === 'weight' || key === 'casing' || key === 'colour') {
+    // An outline that has just appeared or gone is a layer per run
+    // rather than a width on one, and a layer added now would be laid
+    // down over the lines instead of under them. Replaying the picture
+    // at the same moment puts them back in order; it is 40-60 ms, and it
+    // happens on the one step of the drag that crosses zero.
+    const on = state.casing > 0;
+    if (on !== play.casingOn) {
+      play.casingOn = on;
+      playSeek(play.at);
+      return;
+    }
+    playRestyle();
+    return;
+  }
+  clearTimeout(play.lookTimer);
+  play.lookTimer = setTimeout(() => playRebuild(playClock(play.at)), 400);
 }
 
 const PLAY_GLYPH = { death: '\u2620', warp: '\u2726', respawn: '\u2739' };
@@ -3934,13 +5260,39 @@ function playFlash(e, animate) {
   // so it lasts the way the world's marks do rather than being cleared with
   // the overlay when you walk out.
   const home = where;
-  if (!home && !playSamePlace(play.where, e.where)) return;
+  const arrives = home || playSamePlace(play.where, e.where);
   const into = home ? play.marks : play.insideMarks;
   const pane = home ? 'playmarks' : 'playinside';
-  if (kind === 'warp' && e.from) {
+  // The end you left from is in its own place, which is not always the
+  // place the arrival is in. Resolving both against the arrival's put a mark
+  // drawn in a cave's own frame into the world's marks, where it stayed for
+  // the rest of the playback -- standing on open ground up to 270 px from
+  // anything, at a spot inside a cave that had long since come off the map.
+  // That is the thing this file warns about from the other direction: a
+  // teleporter in Stormveil leaving its arc lying across Limgrave.
+  //
+  // So each end asks about itself. Out on the world, or inside a dungeon
+  // drawn in the open, it lasts like the world's own marks; inside the
+  // dungeon currently on screen it goes up and comes down with it; and
+  // inside one that is not on screen there is no frame here to draw it in,
+  // so it falls back to that dungeon's pin, which is exactly what the
+  // finished map draws for the same end.
+  const fromOpen = playOpen(e.from_where || 'world');
+  const fromHere = fromOpen || playSamePlace(play.where, e.from_where);
+  const fromInside = !fromOpen && fromHere;
+  const fromXY = fromHere ? e.from : e.from_pin;
+  // Each end can be drawable on its own, so the event is only skipped when
+  // neither is. A jump into a cave seeked past has an arrival there is no
+  // frame for, and the surface it set off from is still on the screen: the
+  // map draws that end whether or not the other one can be drawn, and there
+  // is no reason for the playback to lose it.
+  const departs = kind === 'warp' && !!fromXY;
+  if (!arrives && !departs) return;
+  if (departs) {
     // The end you left from, which stays. The map marks both ends of every
     // jump for the same reason: where you went is only half of a teleport.
-    const left = playMark(kind, e.from, pane, into, e);
+    const left = playMark(kind, fromXY, fromInside ? 'playinside' : 'playmarks',
+                          fromInside ? play.insideMarks : play.marks, e);
     left.bindPopup(() => playMarkPopup(e, 'from'));
     // Both ends and the line between them are the whole of what a teleport
     // is -- but drawn all at once they say "these two places are related",
@@ -3954,7 +5306,7 @@ function playFlash(e, animate) {
     //
     // Its own canvas, so drawing it and fading it out cost one line's worth
     // of repaint rather than the whole route's.
-    if (animate) {
+    if (animate && arrives) {
       // The map is about to be sent somewhere it has never drawn, and a whole
       // screen of tiles arriving at once is what the jump feels like it is
       // waiting for. The line takes PLAY_TRAVEL_MS to get there, and the
@@ -3988,16 +5340,16 @@ function playFlash(e, animate) {
         // had four hundred milliseconds to move the map under it.
         play.centre = { xy: e.xy, until: Date.now() + PLAY_TRAVEL_MS,
                         at: state.holdSpot
-                          ? map.latLngToContainerPoint(toLatLng(e.from))
+                          ? map.latLngToContainerPoint(toLatLng(fromXY))
                           : null };
       }
-      const arc = L.polyline([toLatLng(e.from), toLatLng(e.from)], {
+      const arc = L.polyline([toLatLng(fromXY), toLatLng(fromXY)], {
         renderer: home ? arcRenderer : insideRenderer,
         pane: home ? 'playarc' : 'inside',
         color: '#8fb7cc', weight: 2, opacity: ARC_OPACITY, dashArray: '4,7',
       }).addTo(home ? play.group : insideGroup);
       playLand(left);
-      playTravel(arc, e.from, e.xy);
+      playTravel(arc, fromXY, e.xy);
       // It arrives over four hundred milliseconds and used to vanish between
       // one frame and the next, which reads as a glitch rather than as the
       // end of something.
@@ -4005,13 +5357,14 @@ function playFlash(e, animate) {
                   home ? play.group : insideGroup);
     }
   }
+  if (!arrives) return;
   // The lasting mark, so the playback accumulates a record the way the map
   // does. The flash on top of it is the part that is only for the moment.
   const lasting = playMark(kind, e.xy, pane, into, e);
   lasting.bindPopup(() => playMarkPopup(e));
   // The arrival lands when the line reaches it, not when it sets off.
   if (animate) {
-    const wait = kind === 'warp' && e.from ? PLAY_TRAVEL_MS : 0;
+    const wait = departs ? PLAY_TRAVEL_MS : 0;
     // The map arrives when the mark does, off the same timer, so a pause
     // mid-jump still ends up looking at the place the jump went to.
     if (wait) setTimeout(() => { playLand(lasting); playCentre(); }, wait);
@@ -4382,6 +5735,7 @@ function playDrawTo(elapsed, animate) {
     if (run.t[run.t.length - 1] <= now) {
       playLine(run, run.xy.length);
       play.here = run.xy[run.xy.length - 1];
+      play.nowRun = run;
       play.onPlane = run.plane || 'surface';
       play.cursor++;
       play.head = null;
@@ -4406,6 +5760,7 @@ function playDrawTo(elapsed, animate) {
       }
     }
     play.here = tip || run.xy[n - 1];
+    play.nowRun = run;
     play.onPlane = run.plane || 'surface';
     // `|| tip` and not `n > 1` alone: a run reached at its first point now has
     // a line to draw as soon as the clock is any way into it, instead of
@@ -4449,7 +5804,10 @@ function playDrawTo(elapsed, animate) {
     if (play.head && play.head.run === run) {
       const pts = run.xy.slice(0, n);
       if (tip) pts.push(tip);
-      play.head.line.setLatLngs(pts.map(toLatLng));
+      const ll = pts.map(toLatLng);
+      play.head.line.setLatLngs(ll);
+      // The outline is a second layer under the same run, so it grows with it.
+      if (play.head.line._casing) play.head.line._casing.setLatLngs(ll);
     } else {
       const line = playLine(run, n, false, tip);
       play.head = line ? { run, line } : null;
@@ -4718,6 +6076,9 @@ function playTrackAt(f) {
 
 // The two grips, and the shading over the part of the route they cut off.
 function playTrimUI() {
+  playSessionsMark();
+  // Nothing to undo when the grips are already at the ends.
+  control('ps-all').hidden = play.from <= 0 && play.until >= play.to;
   const a = play.to ? play.from / play.to : 0;
   const b = play.to ? play.until / play.to : 1;
   const grip = (id, f) => { const el = control(id); if (el.style) el.style.left = playTrackAt(f); };
@@ -4880,6 +6241,7 @@ function playLeftText(ms) {
 }
 
 function playClockText(elapsed, now) {
+  playSessionsNow();
   // How far through the *playback*, which is the window between the grips and
   // not the whole route: trim off the first three weeks and you want to know
   // how much of what you asked for is left, not how much of what you did not.
@@ -4974,6 +6336,7 @@ async function enterPlayback() {
   play.from = 0;
   play.until = play.to;
   play.at = 0;
+  play.casingOn = state.casing > 0;
   playTrimUI();
 
   play.plane0 = state.plane;
@@ -4995,6 +6358,8 @@ async function enterPlayback() {
   });
   control('timeline').hidden = false;
   control('toll').hidden = false;
+  control('play-sessions').hidden = false;
+  buildPlaySessions();
   playTicks();
   playReset();
   setStats(`Playing ${script.runs.length} stretches of path, `
@@ -5021,6 +6386,7 @@ function exitPlayback() {
   playButton('idle');
   control('timeline').hidden = true;
   control('toll').hidden = true;
+  control('play-sessions').hidden = true;
   control('play-ticks').replaceChildren();
   playHover(null);
   document.body.classList.remove('playing');
@@ -5117,6 +6483,7 @@ function playSeek(elapsed) {
 
 function wirePlayback() {
   wireTrim();
+  wirePlaySessions();
   // A mode, so it says which way it is set rather than what pressing it would
   // do -- the same reasoning as the plane buttons and the marker checkboxes.
   const rep = control('play-repeat');
@@ -5268,32 +6635,96 @@ async function placeYouFromLast() {
 /* --- the dungeon you are standing in ------------------------------------- */
 
 // The tail, in the frame the dungeon is being drawn in. Rebuilt whole rather
-// than appended to: it is at most a few seconds of walking, and rebuilding is
-// what makes it survive the overlay being redrawn under it with a frame that
-// may have changed.
+// than appended to: it is a few seconds of walking, and rebuilding is what
+// makes it survive the overlay being redrawn under it with a frame that may
+// have changed.
+//
+// "A few seconds" is now true. It used to hold everything since you walked
+// in -- `state.liveInside` is never trimmed and the overlay never took any
+// of it back -- so after nine minutes in a cave the tail was 751 points in
+// one hardcoded colour lying over a committed path of 778 across the same
+// 204 by 225 m. Two drawings of one walk, and the flat one on top: which is
+// the whole of "the cave I'm in, the 'by age' doesn't seem to work in it",
+// since the banded drawing underneath was never the one you could see. It
+// hid the height ramp just as completely.
+//
+// So the tail now starts where the drawing underneath stops. `inside.drawnTo`
+// is the newest moment the overlay has fetched, and the point at that moment
+// is kept rather than dropped, so the two join rather than leaving a gap.
 function redrawLiveInside() {
-  if (state.liveInsideLine) {
-    insideLiveGroup.removeLayer(state.liveInsideLine);
-    state.liveInsideLine = null;
-  }
+  insideLiveGroup.clearLayers();
+  state.liveInsideRuns = [];
   const at = inside.transform && inside.transform.at;
   if (!at || state.liveInside.length < 2) return;
-  const runs = [[]];
-  for (const p of state.liveInside) {
-    if (p === null) { runs.push([]); continue; }
-    runs[runs.length - 1].push(toLatLng(at(p[0], p[1])));
+  const from = inside.drawnTo || 0;
+  const pts = [];
+  const ts = [];
+  for (let i = 0; i < state.liveInside.length; i++) {
+    const p = state.liveInside[i];
+    const t = state.liveInsideT[i];
+    // A null is a break -- a load screen inside a dungeon is a death or a
+    // lift -- and the line stops there rather than being drawn through the
+    // rock. It carries no moment of its own, so it is kept while anything
+    // after it is.
+    if (p === null) { pts.push(null); ts.push(null); continue; }
+    if (t !== null && t !== undefined && t < from) { pts.length = 0; ts.length = 0; continue; }
+    pts.push(toLatLng(at(p[0], p[1])));
+    ts.push(t);
   }
-  const drawn = runs.filter((r) => r.length > 1);
-  if (!drawn.length) return;
-  state.liveInsideLine = L.polyline(drawn, {
-    renderer: insideRenderer,
-    pane: 'inside',
-    color: state.tint === 'solid' ? state.colour : '#f7d488',
-    weight: liveWeight(),
-    opacity: 1,
-    lineJoin: 'round',
-    lineCap: 'round',
-  }).addTo(insideLiveGroup);
+  // Banded like the committed path beside it, and only under `by age` --
+  // in the other two modes the tail's brightness is what marks it as the
+  // live one, which is the rule the surface tail already follows.
+  const flat = state.tint !== 'age';
+  const bands = flat ? null
+    : ts.map((t) => (t === null || t === undefined ? null : ageBand(t)));
+  const runs = [];
+  let start = -1;
+  for (let i = 0; i <= pts.length; i++) {
+    const end = i === pts.length;
+    const gap = !end && pts[i] === null;
+    if (start < 0) {
+      if (!end && !gap) start = i;
+      continue;
+    }
+    const bandEnds = !end && !gap && !flat && bands[i] !== bands[start];
+    if (!end && !gap && !bandEnds) continue;
+    // A change of colour shares its boundary point with the next run so the
+    // line is never broken by its own gradient; a gap does not, because
+    // breaking there is the point.
+    if ((bandEnds ? i + 1 : i) - start > 1) {
+      runs.push({ from: start, upto: bandEnds ? i + 1 : i,
+                  band: bands && bands[start] });
+    }
+    start = bandEnds ? i : -1;
+  }
+  if (!runs.length) return;
+  const weight = liveWeight();
+  // Every outline before every line, for the reason the route keeps its
+  // casings in a group of their own: within one canvas the order they go on
+  // is the order they are painted, so a run's outline drawn after its
+  // neighbour's line would sit on top of it at the seam.
+  if (state.casing > 0) {
+    for (const r of runs) {
+      L.polyline(pts.slice(r.from, r.upto), {
+        renderer: insideRenderer, pane: 'inside',
+        color: '#0d0b08', weight: weight + state.casing,
+        opacity: 0.55, lineJoin: 'round', lineCap: 'round',
+      }).addTo(insideLiveGroup);
+    }
+  }
+  for (const r of runs) {
+    const line = L.polyline(pts.slice(r.from, r.upto), {
+      renderer: insideRenderer,
+      pane: 'inside',
+      color: flat ? (state.tint === 'solid' ? state.colour : '#f7d488')
+                  : bandColor(r.band),
+      weight,
+      opacity: 1,
+      lineJoin: 'round',
+      lineCap: 'round',
+    }).addTo(insideLiveGroup);
+    state.liveInsideRuns.push(line);
+  }
 }
 
 // Looking at the world from inside a cave.
@@ -5335,7 +6766,24 @@ function peekOffer(show) {
 }
 
 async function startLiveInside(mapStr) {
+  // Whatever is on screen belongs to the place you have just left.
+  //
+  // Reported from the field: a Hero's Grave under a legacy dungeon, a
+  // death in it, and the respawn puts you back in the castle -- which is
+  // world-visible, so refreshLiveInside() takes the branch that draws the
+  // permanent paths and returns. That branch has nothing to say about an
+  // overlay, because it assumes there is none: the world stayed dimmed
+  // and the grave stayed drawn while the position mark walked around the
+  // castle. In the recording, 15:41 into m35_00, dead at 15:43:20, and
+  // back in m11_00 thirteen seconds later.
+  //
+  // Here rather than in that branch, because this is the one function
+  // that runs exactly when the map you are in changes -- the branch runs
+  // every five seconds, and clearing there would take down a cave you had
+  // deliberately hovered while standing in a castle.
+  hideInside(true);
   state.liveInside = [];
+  state.liveInsideT = [];
   redrawLiveInside();
   clearInterval(state.insideTimer);
   await refreshLiveInside(mapStr);
@@ -5355,6 +6803,7 @@ function stopLiveInside() {
   // cave stayed on screen until you happened to click the map.
   refreshes.insideLive++;
   state.liveInside = [];
+  state.liveInsideT = [];
   redrawLiveInside();
   if (inside.live) { inside.live = false; hideInside(true); }
 }
@@ -5390,6 +6839,12 @@ async function refreshLiveInside(mapStr) {
         inside.transform = {
           map_id: open.map_id, at: interiorTransform(open, d),
         };
+        // The castle's permanent drawing has just been redrawn with this
+        // walk in it, so the tail starts where that stops -- the same reason
+        // it does for a cave, and the reason a castle needs saying too is
+        // that this branch never goes near drawInside().
+        inside.drawnTo = drawnUpTo(d);
+        redrawLiveInside();
       }
       return;
     }
@@ -5426,12 +6881,22 @@ async function buildStats() {
   // bottom of the panel, and appending rows to it replaced the count.
   const box = control('numbers');
   if (!box.appendChild) return;          // an older page without the section
-  let d;
   try {
-    d = await (await fetch('/api/stats')).json();
+    state.stats = await (await fetch('/api/stats')).json();
   } catch (e) {
     return;                              // no recorder: the map still works
   }
+  renderStats();
+}
+
+// Split from the fetch because two of the rows are not the server's: the
+// busiest teleport and the busiest grace are counted off the same lists the
+// map draws its marks from, so they are rebuilt whenever those change and
+// never go stale against the badges they agree with.
+function renderStats() {
+  const box = control('numbers');
+  const d = state.stats;
+  if (!d || !box.appendChild) return;
   const km = (m) => (m >= 1000 ? `${(m / 1000).toFixed(1)} km`
                                : `${Math.round(m)} m`);
   const spell = (ms) => {
@@ -5463,15 +6928,40 @@ async function buildStats() {
     // four castles beside twenty-five caves was a number nobody was reading.
     ['Caves and dungeons', `${d.dungeons}`],
   ];
+  // The two places you went back to most, each with a way to go and look.
+  // After the counts they are about, and left out entirely where the busiest
+  // spot was used once -- which is every spot, on a route with no repeats.
+  const jump = busiestWarp();
+  const grace = busiestRespawn();
+  const at = rows.findIndex(([what]) => what === 'Caves and dungeons');
+  const extra = [];
+  if (jump) {
+    extra.push(['Most used teleport', `${jump.n}`,
+                () => goToSpot(jump), warpSpotTitle(jump)]);
+  }
+  if (grace) {
+    extra.push(['Most used respawn', `${grace.n}`,
+                () => goToSpot(grace), respawnSpotTitle(grace)]);
+  }
+  rows.splice(at < 0 ? rows.length : at, 0, ...extra);
   // Only once there is any: with nothing recorded down there a nought reads
   // as a broken reading rather than as somewhere you have not been.
   if (d.underground_m > 0) rows.splice(2, 0, ['Underground', km(d.underground_m)]);
   box.textContent = '';
-  for (const [what, value] of rows) {
+  for (const [what, value, go, title] of rows) {
     const row = document.createElement('div');
     const label = document.createElement('span');
     label.textContent = what;
-    const num = document.createElement('b');
+    // A value you can press, for the rows that stand for a place. Shaped
+    // like the numbers around it rather than like a button, because it is a
+    // number first: the chevron and the hover are what say it can be
+    // pressed, and the popup it opens is the rest of the answer.
+    const num = document.createElement(go ? 'button' : 'b');
+    if (go) {
+      num.className = 'stat-go';
+      num.title = title || '';
+      num.addEventListener('click', go);
+    }
     num.textContent = value;
     row.append(label, num);
     box.appendChild(row);
@@ -5593,6 +7083,155 @@ function sessionRow(s) {
 
   row.append(label, one, del);
   return row;
+}
+
+// Which session the playback is set to, if it is set to one. A fact
+// about the two grips rather than about what was last pressed, so
+// dragging a grip onto another evening moves the mark with it.
+function playIsSession(s) {
+  if (!play.on || !play.axis) return false;
+  // The whole route is not "that session", even though the oldest session's
+  // span clamps to both ends of the axis and so matches it exactly.
+  if (play.from <= 0 && play.until >= play.to) return false;
+  const from = playElapsedFor(s.started_ms);
+  const until = s.ended_ms ? playElapsedFor(s.ended_ms) : play.to;
+  return until > from
+    && Math.abs(play.from - from) < 1 && Math.abs(play.until - until) < 1;
+}
+
+function playSessionRow(s) {
+  const when = new Date(s.started_ms).toLocaleDateString(undefined, {
+    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+  });
+  const row = document.createElement('button');
+  row.className = playIsSession(s) ? 'ps-row on' : 'ps-row';
+  row.dataset.session = s.id;
+  row.title = `Play ${when} back`;
+  const go = document.createElement('i');
+  go.className = 'go';
+  const text = document.createElement('span');
+  text.textContent = when;
+  const len = document.createElement('span');
+  len.className = 'len';
+  len.textContent = s.active_ms ? playedFor(s.active_ms) : '\u2013';
+  row.append(go, text, len);
+  row.addEventListener('click', () => playSession(s));
+  return row;
+}
+
+// The list on the map. Only sessions with something in them: a row you
+// press and nothing happens is worse than no row, and playSession()
+// would have nothing to put the grips around.
+function buildPlaySessions() {
+  const box = control('ps-list');
+  if (!box.replaceChildren) return;
+  const all = (state.meta.sessions || []).filter((s) => s.samples > 0);
+  const newest = [...all].sort((a, b) => b.started_ms - a.started_ms);
+  const shown = newest.slice(0, playSessShown);
+  box.replaceChildren(...shown.map(playSessionRow));
+  const rest = newest.length - shown.length;
+  const more = control('ps-more');
+  more.hidden = rest <= 0;
+  // All of them at once rather than five at a time. Opening five at a time
+  // grew the panel five rows per press, and this one stands on the map with
+  // its top pinned 16 px down -- so the button that does the growing walked
+  // off the bottom of the screen and there was no way to press it again. The
+  // list scrolls inside itself now and the buttons stay where they are, so
+  // the panel cannot outgrow the window however many evenings are in it.
+  if (rest > 0) more.textContent = `Show all ${newest.length}`;
+  control('ps-fewer').hidden = playSessShown <= PLAY_SESSIONS_SHOWN;
+}
+
+// Only the mark, for the times the window changes under a list that is
+// already right: a grip drag, a seek that clamps, a rebuild.
+// Which session the playhead is in. Not the same question as which one
+// the grips are around: you can trim to one evening and watch it, or
+// leave the window open and drift through several. Between two sessions
+// -- the recorder was off -- it names the one you were last in, which is
+// where the path you are looking at was walked.
+function playSessionNow() {
+  if (!play.on || !play.axis) return null;
+  const all = (state.meta.sessions || []).filter((s) => s.samples);
+  const run = play.nowRun;
+  if (run && run.session) {
+    const s = all.find((x) => x.id === run.session);
+    if (s) return s;
+  }
+  // No run under the playhead -- a gap between two of them, or a path
+  // drawn inside a dungeon, which comes from an endpoint of its own.
+  // Then the clock, and where it is ambiguous the narrowest session
+  // containing it, since an import that spans an afternoon is the least
+  // specific answer available.
+  const at = playClock(play.at);
+  let best = null;
+  let last = null;
+  for (const s of all) {
+    const end = s.ended_ms || Infinity;
+    if (at >= s.started_ms && at <= end) {
+      if (!best || end - s.started_ms < best.ended_ms - best.started_ms) {
+        best = { ...s, ended_ms: end };
+      }
+    } else if (at > s.started_ms
+               && (!last || s.started_ms > last.started_ms)) {
+      last = s;
+    }
+  }
+  return best ? all.find((s) => s.id === best.id) : last;
+}
+
+// Called from the clock, which is throttled to ten a second and always
+// runs on a seek. The row is rebuilt only when the answer changes, so
+// what it costs the rest of the time is one comparison.
+function playSessionsNow() {
+  const box = control('ps-now');
+  if (!box.replaceChildren) return;
+  const s = playSessionNow();
+  const id = s ? String(s.id) : '';
+  if (box.dataset.at === id) return;
+  box.dataset.at = id;
+  box.replaceChildren(...(s ? [playSessionRow(s)] : []));
+}
+
+function playSessionsMark() {
+  const box = control('ps-list');
+  if (!box.querySelectorAll) return;
+  const by = new Map((state.meta.sessions || []).map((s) => [s.id, s]));
+  for (const row of box.querySelectorAll('.ps-row')) {
+    const s = by.get(+row.dataset.session);
+    row.classList.toggle('on', !!s && playIsSession(s));
+  }
+}
+
+function wirePlaySessions() {
+  const box = control('play-sessions');
+  const head = control('ps-head');
+  const fold = (shut) => {
+    if (box.classList) box.classList.toggle('shut', shut);
+    if (head.setAttribute) head.setAttribute('aria-expanded', String(!shut));
+  };
+  fold(pref('psShut') === 'true');
+  head.addEventListener('click', () => {
+    const shut = !(box.classList && box.classList.contains('shut'));
+    fold(shut);
+    savePref('psShut', shut);
+  });
+  control('ps-more').addEventListener('click', () => {
+    playSessShown = Infinity;
+    buildPlaySessions();
+  });
+  control('ps-fewer').addEventListener('click', () => {
+    playSessShown = PLAY_SESSIONS_SHOWN;
+    buildPlaySessions();
+  });
+  // Back to the whole route. The grips are the whole of what a session
+  // playback is, so putting them at the ends is the whole of the undo --
+  // and where you are watching is left alone, because the window opening
+  // out around you is not a reason to move.
+  control('ps-all').addEventListener('click', () => {
+    play.from = 0;
+    play.until = play.to;
+    playTrimUI();
+  });
 }
 
 // One session, played back on its own.
@@ -5729,8 +7368,19 @@ const RANGE_BARS = '.slider input[type=range], #play-speed';
 function paintRange(el) {
   const lo = +el.min || 0;
   const hi = el.max === '' ? 100 : +el.max;
-  const at = hi === lo ? 0 : ((+el.value - lo) / (hi - lo)) * 100;
-  el.style.setProperty('--fill', `${at}%`);
+  // Unitless: the sheet turns it into a length that ends under the
+  // middle of the thumb, which is not the same as a fraction of the
+  // track -- the thumb travels between its own half-widths.
+  el.style.setProperty('--fill', String(hi === lo ? 0
+                                        : (+el.value - lo) / (hi - lo)));
+}
+
+// Once, at wiring time. Every bar repaints itself from then on.
+function wireRangeFills() {
+  for (const el of document.querySelectorAll(RANGE_BARS)) {
+    paintRange(el);
+    el.addEventListener('input', () => paintRange(el));
+  }
 }
 
 // Every one of them, for the moments a value is set rather than dragged:
@@ -5842,6 +7492,10 @@ function wireControls() {
   // put it back until the playback walked out and in again.
   map.on('click', (e) => {
     if (placing.map_id !== null) { placeAt(e.latlng); return; }
+    // The window for a place that is nowhere is opened from a button in
+    // the corner, so it has no marker to click off -- and it sits over
+    // the map, which makes the map the obvious thing to click instead.
+    closeInterior();
     // During playback a click on the path goes to the moment it was walked.
     if (play.on) { playGoToHover(); return; }
     hideInside(true);
@@ -5851,6 +7505,15 @@ function wireControls() {
     insideHover(e.latlng);
   });
   map.on('mouseout', () => playHover(null));
+  // Leaflet's mouseout is about the map, and the map is not the only
+  // thing on screen: the timeline and the session list are stacked over
+  // it, and a press that begins on the path is a map drag -- so the
+  // pointer can arrive at the bar with the mark still standing. Whatever
+  // the gesture was, being over one of these means not being on the path.
+  for (const id of ['timeline', 'play-sessions', 'toll', 'inset']) {
+    control(id).addEventListener('pointerenter', () => playHover(null));
+  }
+  map.getContainer().addEventListener('mouseleave', () => playHover(null));
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
     if (placing.map_id !== null) { stopPlacing(); return; }
@@ -5926,6 +7589,9 @@ function wireControls() {
       // something on its own.
       try { localStorage.setItem(`route.${key}`, state[key]); } catch (e) { /* private mode */ }
       syncPathRows();
+      if (play.on) { playLookChanged(key); return; }
+      // Not redrawEverything(): it ends the playback before it redraws,
+      // so reaching for the thickness while watching threw you out.
       redrawEverything();
     });
   }
@@ -6058,7 +7724,7 @@ function wireControls() {
   applyRange(true);
 
   // Last, so every preference restored above is on its slider by now.
-  paintRanges();
+  wireRangeFills();
 }
 
 async function redrawEverything() {

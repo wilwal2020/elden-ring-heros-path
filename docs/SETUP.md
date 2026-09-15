@@ -41,7 +41,7 @@ somewhere you can find again.
 ## 3. Install the Python packages
 
 ```bash
-pip install -r requirements.txt
+pip install -r tools/requirements.txt
 ```
 
 You can skip this: `Record route.bat` and `Open map.bat` install what is
@@ -77,8 +77,8 @@ a different detail level.
 3. And the underground -- Siofra, Ainsel, Deeproot -- with `--map M01`:
 
    ```bash
-   python tools/build_map.py <where you extracted> --map M01 -o m1-underground.png
-   python tools/make_tiles.py m1-underground.png --out viewer/tiles-underground
+   python tools/build_map.py <where you extracted> --map M01 -o assets/m1-underground.png
+   python tools/make_tiles.py assets/m1-underground.png --out viewer/tiles-underground
    ```
 
 4. `make_tiles.py` prints the finished size. Put those numbers into

@@ -3,7 +3,7 @@
 data/
 
 # The stitched source images. The tile pyramids built from them are checked in
-# -- see NOTICE.md -- but these are 33 MB each and only needed to cut the
+# -- see docs/NOTICE.md -- but these are 33 MB each and only needed to cut the
 # tiles again, which nobody has to do.
 m1.png
 m1-underground.png
